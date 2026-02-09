@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# --- Virtual env ---
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Editors/OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Data / artifacts (DON'T COMMIT) ---
+data/
+datasets/
+videos/
+raw/
+outputs/
+runs/
+logs/
+checkpoints/
+weights/
+models/
+
+# Common ML files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.tflite
+*.npz
+*.npy
+
+# Big media
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
