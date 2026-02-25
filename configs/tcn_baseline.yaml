@@ -1,0 +1,30 @@
+exp:
+  name: dev_minimal
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/data/dataset_v0   # change to your real json root
+  runs_root: /home/anna/TCN_TRAIN/outputs/runs
+
+data:
+  max_persons: 25
+  window_size: 16
+  window_step: 4
+  split: fixed
+
+features:
+  # match what your current frame_to_vector does
+  use_bbox: true
+  use_keypoints: true
+
+labels:
+  # match your current events_to_label
+  task: binary
+  window_policy: center
+  drop_mixed_windows: true
+
+train:
+  device: cpu
+  batch_size: 64
+  epochs: 2
+  lr: 0.0005

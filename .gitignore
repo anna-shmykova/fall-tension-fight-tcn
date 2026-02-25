@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.so
 *.egg-info/
+configs/local_paths.yaml
 build/
 dist/
 
@@ -25,10 +26,12 @@ datasets/
 videos/
 raw/
 outputs/
+outputs_not_used/
 runs/
 logs/
 checkpoints/
 weights/
+artifacts/
 models/
 
 # Common ML files

@@ -1,0 +1,61 @@
+exp:
+  name: tcn_baseline
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/data/dataset_v0   # change to your real json root
+  runs_root: /home/anna/TCN_TRAIN/runs
+
+data:
+  label_mode: "binary_tension"   # or multi-class later
+  window_size: 16
+  window_step: 4
+  fps: 25
+  sample_every_n_frames: 5
+  max_persons: 25
+
+  # thresholds applied at training time (NOT during json creation)
+  det_conf_keep: 0.6
+  kp_conf_keep: 0.3
+
+  split:
+    mode: "generate"
+    group_key: "video_id"
+    seed: 42
+    val_ratio: 0.2
+    train_list: "train.txt"
+    val_list: "val.txt"
+
+features:
+  use_bbox: true
+  use_keypoints: false
+  use_quality_gates: true
+  normalize: "bbox"   # "frame" or "bbox"
+
+model:
+  type: "tcn"
+  causal: true
+  hidden_dim: 64
+  num_layers: 4
+  dilations: [1, 2, 4, 8]
+  kernel_size: 3
+  dropout: 0.2
+  mlp_out_dim: 32
+  pool_mode: mean_max_std
+
+train:
+  batch_size: 32
+  epochs: 15
+  lr: 0.0005
+  weight_decay: 0.0001
+  pos_weight: 4.0
+  grad_clip: 1.0
+  early_stop_patience: 7
+  num_workers: 1
+  device: cuda
+  
+eval:
+  threshold_sweep:
+    start: 0.01
+    end: 0.99
+    step: 0.01
