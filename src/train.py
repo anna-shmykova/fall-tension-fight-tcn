@@ -25,7 +25,7 @@ from src.data.splits import (
     write_split_files
     )
 from src.data.dataset import EventJsonDataset
-from src.models.tcn import EventTCN
+from src.models.tcn import MLP_POOL
 from src.utils.metrics import (
     compute_auprc,
     threshold_sweep_binary,
@@ -70,6 +70,8 @@ def end_weighted_bce_loss(logits_bt: torch.Tensor, y_b: torch.Tensor, pos_weight
     logits_end = logits_bt[:, -k:]                  # (B,k)
     y_end = y_b.view(B, 1).expand(B, k).float()     # (B,k)
     return F.binary_cross_entropy_with_logits(logits_end, y_end, pos_weight=pos_weight, reduction="mean")
+
+    
 def load_yaml(path: Path) -> Dict[str, Any]:
     import yaml
     with path.open("r", encoding="utf-8") as f:
@@ -190,8 +192,8 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device) 
         y = y.to(device).float()  # (B,)
         #logits = model(X).view(-1)  # (B,)
         logits_bt = model(X)  # (B,T)
-        win_logits = aggregate_window_logits(logits_bt)  # (B,) mode=agg_mode,  temperature=temperature
-        all_logits.append(win_logits.detach().cpu())
+        #win_logits = aggregate_window_logits(logits_bt)  # (B,) mode=agg_mode,  temperature=temperature
+        all_logits.append(logits_bt.detach().cpu())
         all_targets.append(y.detach().cpu())
 
     logits = torch.cat(all_logits).numpy()
@@ -233,17 +235,17 @@ def train_one_epoch(
         optim.zero_grad(set_to_none=True)
         logits_bt = model(X)  # (B,T)
 
-        win_logits = aggregate_window_logits(logits_bt)  # (B,)mode=agg_mode,,  temperature=temperature
-        loss_main = criterion(win_logits, y)
+        #win_logits = aggregate_window_logits(logits_bt)  # (B,)mode=agg_mode,,  temperature=temperature
+        loss = criterion(logits_bt, y)
         
-        if end_loss_alpha > 0:
+        '''if end_loss_alpha > 0:
             pos_weight = getattr(criterion, "pos_weight", torch.tensor(1.0, device=device))
             loss_end = end_weighted_bce_loss(logits_bt, y, pos_weight=pos_weight, k_last=end_loss_k)
             loss = (1 - end_loss_alpha) * loss_main + end_loss_alpha * loss_end
         else:
             loss = loss_main
                 #logits = model(X).view(-1)  # (B,)
-                #loss = criterion(logits, y)
+                #loss = criterion(logits, y)'''
         loss.backward()
 
         if grad_clip is not None:
@@ -384,12 +386,12 @@ def main() -> None:
     print(f"[INFO] data_shape X, y: {X0.shape}, {y0.shape}")
 
     model_cfg = cfg.get("model", {})
-    model = EventTCN(
-        input_dim=C,
-        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
-        num_layers=int(model_cfg.get("num_layers", 4)),
+    model = MLP_POOL(
+        #input_dim=C,
+        #hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+        #num_layers=int(model_cfg.get("num_layers", 4)),
         #dilations=list(model_cfg.get("dilations", [1, 2, 4, 8])),
-        kernel_size=int(model_cfg.get("kernel_size", 3)),
+        #kernel_size=int(model_cfg.get("kernel_size", 3)),
         #dropout=float(model_cfg.get("dropout", 0.2)),
         #causal=bool(model_cfg.get("causal", True)),
     )

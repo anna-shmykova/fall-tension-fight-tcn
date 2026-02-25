@@ -26,10 +26,10 @@ class EventJsonDataset(Dataset):
                 X_win = X_seq[start:end] # (T, C)
                 y_win = y_seq[start:end]    # (T,)
                 #ignore examples of dataset where events are at the very beginning and at the very end
-                count_pos_beg = np.sum(y_win[:window_size//2] == 1)
-                count_pos_end = np.sum(y_win[window_size//2:] == 1)
-                if y_win[window_size//2] == 1 or (y_win[window_size//2] == 0 and (count_pos_beg == 0 and count_pos_end == 0)):
-                    y_central = y_win[window_size//2]
+                #count_pos_beg = np.sum(y_win[:window_size//2] == 1)
+                #count_pos_end = np.sum(y_win[window_size//2:] == 1)
+                #if y_win[window_size//2] == 1 or (y_win[window_size//2] == 0 and (count_pos_beg == 0 and count_pos_end == 0)):
+                y_central = y_win[-1]
                     #print(y_central)
                 
                     # if window has only 'none', keep only a fraction
@@ -37,9 +37,9 @@ class EventJsonDataset(Dataset):
                         #if np.random.rand() > 0.2:  # keep ~20% of pure-none windows
                             #continue
     
-                    self.samples.append((X_win, y_central))
-                else:
-                    continue
+                self.samples.append((X_win, y_central))
+                #else:
+                    #continue
                 
         print("Total windows:", len(self.samples))
 

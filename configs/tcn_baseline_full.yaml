@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_RWF_window_16_exclude_tens
+  name: no_tcn_RWF_window_16_exclude_tens
   seed: 42
 
 paths:
