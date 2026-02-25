@@ -128,3 +128,51 @@ class EventTCN(nn.Module):
         logits = self.fc(mid_feat).squeeze(-1)  # (B,)
         #logits = self.fc(feat)#.squeeze(-1)  # (B,)  raw score
         return logits
+<<<<<<< Updated upstream
+=======
+
+class MLP_POOL(nn.Module):
+    def __init__(self, input_dim=97, num_classes=1,
+                 mlp_out_dim=32, pool_mode="mean_max_std"):
+        super().__init__()
+
+        layers = []
+        self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
+        self.pool = PersonPooling(mode=pool_mode)
+
+        pool_mult = {
+            "mean": 1,
+            "max": 1,
+            "mean_max": 2,
+            "mean_max_std": 3,
+        }
+        if pool_mode not in pool_mult:
+            raise ValueError(f"Unsupported pool_mode: {pool_mode}")
+
+        # TCN input channels must match pooled scene features (+1 for count_norm)
+        in_ch = mlp_out_dim * pool_mult[pool_mode] + 1
+
+        #self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
+        self.fc = nn.Linear(in_ch, 1)   # <--- ONE logit
+
+    def forward(self, x):
+        # x: (B, T, C)
+        # pose_xyc: (B,T,K,V,3) or (B,T,K,V,2)
+        emb, person_mask = self.mlp(x) # B,T,K,out_dim
+        
+        scene = self.pool(emb, mask=person_mask)              # (B,T,C)
+        
+        count = person_mask.sum(dim=2).float()                # (B,T)
+        count_norm = count / person_mask.size(2)              # (B,T) for K fixed
+        #print(count_norm.unsqueeze(-1).shape)
+        scene_count = torch.cat([scene, count_norm.unsqueeze(-1)], dim=-1)  # (B,T,C+1)
+        #print(scene_count.shape)
+        #B, T, K, E = x.shape
+        
+        mid = scene_count.size(-2) // 2
+        mid_scene = scene_count[:, mid, :]              # (B, hidden)
+        #print(mid_scene.shape)
+        logits = self.fc(mid_scene).squeeze(-1)  # (B,)
+        #logits = self.fc(feat)#.squeeze(-1)  # (B,)  raw score
+        return logits
+>>>>>>> Stashed changes

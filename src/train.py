@@ -24,7 +24,7 @@ from src.data.splits import (
     write_split_files
     )
 from src.data.dataset import EventJsonDataset
-from src.models.tcn import EventTCN
+from src.models.tcn import EventTCN, MLP_POOL
 from src.utils.metrics import (
     compute_auprc,
     threshold_sweep_binary,
@@ -264,12 +264,12 @@ def main() -> None:
     print(f"[INFO] data_shape X, y: {X0.shape}, {y0.shape}")
 
     model_cfg = cfg.get("model", {})
-    model = EventTCN(
-        input_dim=C,
-        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
-        num_layers=int(model_cfg.get("num_layers", 4)),
+    model = MLP_POOL(
+        #input_dim=C,
+        #hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+        #num_layers=int(model_cfg.get("num_layers", 4)),
         #dilations=list(model_cfg.get("dilations", [1, 2, 4, 8])),
-        kernel_size=int(model_cfg.get("kernel_size", 3)),
+        #kernel_size=int(model_cfg.get("kernel_size", 3)),
         #dropout=float(model_cfg.get("dropout", 0.2)),
         #causal=bool(model_cfg.get("causal", True)),
     )
