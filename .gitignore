@@ -1,6 +1,7 @@
 # --- Python ---
 __pycache__/
 *.py[cod]
+*.pyc
 *.so
 *.egg-info/
 configs/local_paths.yaml
@@ -21,7 +22,6 @@ env/
 .DS_Store
 
 # --- Data / artifacts (DON'T COMMIT) ---
-data/
 datasets/
 videos/
 raw/
@@ -30,9 +30,8 @@ outputs_not_used/
 runs/
 logs/
 checkpoints/
-weights/
+yolo_weights/
 artifacts/
-models/
 
 # Common ML files
 *.pt
