@@ -128,9 +128,7 @@ class EventTCN(nn.Module):
         logits = self.fc(mid_feat).squeeze(-1)  # (B,)
         #logits = self.fc(feat)#.squeeze(-1)  # (B,)  raw score
         return logits
-<<<<<<< Updated upstream
-=======
-
+        
 class MLP_POOL(nn.Module):
     def __init__(self, input_dim=97, num_classes=1,
                  mlp_out_dim=32, pool_mode="mean_max_std"):
@@ -175,4 +173,3 @@ class MLP_POOL(nn.Module):
         logits = self.fc(mid_scene).squeeze(-1)  # (B,)
         #logits = self.fc(feat)#.squeeze(-1)  # (B,)  raw score
         return logits
->>>>>>> Stashed changes

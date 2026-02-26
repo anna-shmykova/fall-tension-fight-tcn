@@ -1,9 +1,9 @@
 exp:
-  name: tcn_baseline
+  name: without_tcn_baseline
   seed: 42
 
 paths:
-  data_root: /home/anna/TCN_TRAIN/data/dataset_v0   # change to your real json root
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v0   # change to your real json root
   runs_root: /home/anna/TCN_TRAIN/runs
 
 data:
