@@ -1,9 +1,9 @@
 exp:
-  name: tcn_baseline
+  name: tcn_baseline_LR_schedule_csv_reports_curves
   seed: 42
 
 paths:
-  data_root: /home/anna/TCN_TRAIN/data/dataset_v0   # change to your real json root
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v0   # change to your real json root
   runs_root: /home/anna/TCN_TRAIN/runs
 
 data:
@@ -19,12 +19,12 @@ data:
   kp_conf_keep: 0.3
 
   split:
-    mode: "generate"
+    mode: "fixed"
     group_key: "video_id"
     seed: 42
     val_ratio: 0.2
-    train_list: "train.txt"
-    val_list: "val.txt"
+    train_list: "fixed_splits/train_paths.txt"
+    val_list: "fixed_splits/val_paths.txt"
 
 features:
   use_bbox: true

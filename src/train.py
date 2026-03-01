@@ -1,8 +1,9 @@
 # src/train.py
 from __future__ import annotations
-
+import matplotlib.pyplot as plt
 import argparse
 import json
+import csv
 import os
 import random
 import subprocess
@@ -85,6 +86,60 @@ def threshold_for_precision(sweep, target_precision=0.5):
     if not candidates:
         return None
     return max(candidates, key=lambda r: r["recall"])
+    
+def save_history_csv(out_dir: Path, history: list):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "metrics.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+
+def save_threshold_sweep_csv(metrics_dir: Path, sweep: list):
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = metrics_dir / "threshold_sweep.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(sweep[0].keys()))
+        w.writeheader()
+        w.writerows(sweep)
+        
+def save_learning_curves(out_dir: Path, history: list):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    epoch_list = [h["epoch"] for h in history]
+    train_loss_list = [h["train_loss"] for h in history]
+    val_auprc_list = [h["val_auprc"] for h in history]
+    lr_list = [h["lr"] for h in history]
+
+    # Train loss
+    plt.figure()
+    plt.plot(epoch_list, train_loss_list)
+    plt.xlabel("Epoch")
+    plt.ylabel("Train loss")
+    plt.title("Training Loss")
+    plt.grid(True)
+    plt.savefig(out_dir / "train_loss.png", dpi=150)
+    plt.close()
+
+    # Val AUPRC
+    plt.figure()
+    plt.plot(epoch_list, val_auprc_list)
+    plt.xlabel("Epoch")
+    plt.ylabel("Val AUPRC")
+    plt.title("Validation AUPRC")
+    plt.grid(True)
+    plt.savefig(out_dir / "val_auprc.png", dpi=150)
+    plt.close()
+
+    # LR
+    plt.figure()
+    plt.plot(epoch_list, lr_list)
+    plt.xlabel("Epoch")
+    plt.ylabel("Learning rate")
+    plt.title("Learning Rate")
+    plt.grid(True)
+    plt.savefig(out_dir / "lr.png", dpi=150)
+    plt.close()
 
 # ----------------------------
 # Training / Eval loops
@@ -175,10 +230,15 @@ def main() -> None:
     # 3) Create run folder + save resolved config
     exp_name = cfg.get("exp", {}).get("name", "exp")
     run_dir = make_run_dir(runs_root, exp_name)
-    (run_dir / "checkpoints").mkdir(exist_ok=True)
-    (run_dir / "metrics").mkdir(exist_ok=True)
-    (run_dir / "splits").mkdir(exist_ok=True)
+    
+    checkpoints_dir = run_dir / "checkpoints"
+    metrics_dir = run_dir / "metrics"
+    reports_dir = run_dir / "reports"
+    splits_dir = run_dir / "splits"
 
+    for d in [checkpoints_dir, metrics_dir, reports_dir, splits_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+        
     cfg_resolved = dict(cfg)
     cfg_resolved["paths"] = dict(cfg_resolved.get("paths", {}))
     cfg_resolved["paths"]["data_root"] = str(data_root)
@@ -186,7 +246,7 @@ def main() -> None:
     cfg_resolved["run_dir"] = str(run_dir)
 
     save_yaml(cfg_resolved, run_dir / "config_resolved.yaml")
-    (run_dir / "git_commit.txt").write_text(get_git_commit() + "\n", encoding="utf-8")
+    #(run_dir / "git_commit.txt").write_text(get_git_commit() + "\n", encoding="utf-8")
 
     # 4) Collect json paths
     # Expect jsons under data_root (possibly nested).
@@ -199,10 +259,18 @@ def main() -> None:
     split_mode = split_cfg.get("mode", "generate")
 
     if split_mode == "fixed":
-        #train_list = resolve_path(split_cfg["train_list"], root)
-        #val_list = resolve_path(split_cfg["val_list"], root)
-        train_paths = read_paths_txt(train_list, base=data_root)
-        val_paths = read_paths_txt(val_list, base=data_root)
+        train_list = resolve_path(split_cfg["train_list"], root)
+        val_list = resolve_path(split_cfg["val_list"], root)
+        #train_paths = read_paths_txt(train_list, base=data_root)
+        #val_paths = read_paths_txt(val_list, base=data_root)
+        with open(train_list, 'r') as f:
+            lines = f.readlines()
+            train_paths = [line.rstrip('\n') for line in lines]
+
+        with open(val_list, 'r') as f:
+            lines = f.readlines()
+            val_paths = [line.rstrip('\n') for line in lines]
+            
     else:
         # generate per run
         val_ratio = float(split_cfg.get("val_ratio", 0.2))
@@ -212,7 +280,7 @@ def main() -> None:
         )
         write_split_files(
             train_paths, val_paths,
-            out_dir=run_dir / "splits",
+            out_dir=splits_dir,
             train_name="train_paths.txt",
             val_name="val_paths.txt",
             #base=data_root,  # write relative paths to data_root
@@ -273,7 +341,7 @@ def main() -> None:
         #dropout=float(model_cfg.get("dropout", 0.2)),
         #causal=bool(model_cfg.get("causal", True)),
     )
-
+    
     device_str = cfg["train"].get("device", "cpu")
     device = torch.device("cuda" if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
     model.to(device)
@@ -282,7 +350,15 @@ def main() -> None:
     lr = float(cfg["train"].get("lr", 5e-4))
     wd = float(cfg["train"].get("weight_decay", 1e-4))
     optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim,
+        mode="max",      # AUPRC higher is better
+        factor=0.5,      # halve LR
+        patience=2,      # wait 2 epochs without improvement
+        threshold=1e-3,  # min improvement to count
+        min_lr=1e-6,
+        verbose=True,
+    )
     pos_weight = float(cfg["train"].get("pos_weight", 1.0))
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
 
@@ -300,23 +376,44 @@ def main() -> None:
         val_out = evaluate_binary(model, val_loader, device=device)
         val_auprc = val_out["auprc"]
 
-        print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_auprc={val_auprc:.4f} | bestF1={val_out['best_f1']}")
+        # Step scheduler (ReduceLROnPlateau expects metric)
+        scheduler.step(val_auprc)
 
+        # IMPORTANT: read LR AFTER scheduler.step
+        lr = optim.param_groups[0]["lr"]
+        
+        print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_auprc={val_auprc:.4f} | bestF1={val_out['best_f1']} | lr={lr:.2e}")
+        
         history.append({
             "epoch": epoch,
             "train_loss": train_loss,
             "val_auprc": val_auprc,
             "best_f1": val_out["best_f1"],
+            "lr": float(lr),
         })
 
-        # Save best checkpoint
+        # Save metrics.csv every epoch (safer than only on "best")
+        save_history_csv(reports_dir, history)
+        
+        # Save best checkpoint + best-epoch artifacts
         if val_auprc > best_auprc:
             best_auprc = val_auprc
-            ckpt_path = run_dir / "checkpoints" / "best.pt"
-            torch.save({"model": model.state_dict(), "cfg": cfg_resolved}, ckpt_path)
+            ckpt_path = checkpoints_dir / "best.pt"
+            #torch.save({"model": model.state_dict(), "cfg": cfg_resolved}, ckpt_path)
 
+            torch.save(
+            {
+                "model": model.state_dict(),
+                "cfg": cfg_resolved,
+                "epoch": epoch,
+                "best_auprc": best_auprc,
+                "optimizer": optim.state_dict(),
+                "scheduler": scheduler.state_dict(),
+            },
+            ckpt_path
+            )            
             # Save full metrics for best epoch
-            (run_dir / "metrics" / "metrics.json").write_text(
+            ( metrics_dir / "metrics.json").write_text(
                 json.dumps(
                     {
                         "best_epoch": epoch,
@@ -333,14 +430,14 @@ def main() -> None:
                 ) + "\n",
                 encoding="utf-8",
             )
-
-            # Save threshold sweep csv
-            import csv
-            with (run_dir / "metrics" / "threshold_sweep.csv").open("w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(val_out["sweep"][0].keys()))
-                w.writeheader()
-                w.writerows(val_out["sweep"])
-
+            
+            # Threshold sweep csv (only if provided)
+            sweep = val_out.get("sweep", None)
+            if sweep:
+                save_threshold_sweep_csv(metrics_dir, sweep)
+    
+            # Plots for best checkpoint moment (optional)
+            save_learning_curves(reports_dir, history)
     print(f"[DONE] Best AUPRC: {best_auprc:.4f}")
     print(f"[DONE] Run saved to: {run_dir}")
 
