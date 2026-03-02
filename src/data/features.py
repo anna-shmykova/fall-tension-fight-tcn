@@ -7,7 +7,7 @@ def norm_kps_xy_flat_with_mask(kps_xy_flat, cx, cy, w, h, eps=1e-6):
     kps_norm = []
     joint_mask = []
 
-    for j in range(0, len(kps_xy_flat), 2):
+    for j in range(0, len(kps_xy_flat), 3):
         x = kps_xy_flat[j]
         y = kps_xy_flat[j+1]
 
@@ -27,19 +27,19 @@ def frame_to_vector(frame, K, num_pers_features=40, cfg=None):
     frame: dict for one time step
     K: max number of boxes per frame
     """
-    detections = frame['bbs_list_of_keypoints']  # <-- adapt this key name
+    detections = frame['detection_list']  # <-- adapt this key name
 
     # sort boxes by area desc
     dets_sorted = sorted(
         detections,
-        key=lambda d: (d[4] - d[2]) * (d[5] - d[3]),
+        key=lambda d: (d['bbox'][2] - d['bbox'][0]) * (d['bbox'][3] - d['bbox'][1]),
         reverse=True,
     )
 
     boxes = []
     keypoints = []
     for d in dets_sorted[:K]:
-        x1, y1, x2, y2 = d[2:6]
+        x1, y1, x2, y2 = d['bbox']
         w = x2 - x1
         h = y2 - y1
         cx = (x1 + x2 )/ 2
@@ -50,7 +50,7 @@ def frame_to_vector(frame, K, num_pers_features=40, cfg=None):
         cy /= img_h
         w  /= img_w
         h  /= img_h'''
-        kps = d[6][2:]
+        kps = d['key_points'][15:]
         # choose the correct normalizer for your keypoint format:
         kps_norm = norm_kps_xy_flat_with_mask(kps, cx, cy, w, h)          # xy only + mask
         #print(len(kps_norm))
