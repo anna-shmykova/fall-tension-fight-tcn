@@ -24,7 +24,6 @@ env/
 .DS_Store
 
 # --- Data / artifacts (DON'T COMMIT) ---
-data/
 datasets/
 videos/
 raw/
