@@ -35,6 +35,41 @@ from src.utils.metrics import (
 # ----------------------------
 # Helpers
 # ----------------------------
+
+import math
+import torch.nn.functional as F
+
+def aggregate_window_logits(logits_bt: torch.Tensor, mode: str = "logsumexp", temperature: float = 1.0) -> torch.Tensor:
+    """
+    logits_bt: (B,T) -> (B,)
+    mode:
+      - last
+      - max
+      - logsumexp
+      - logmeanexp  (recommended: logsumexp - log(T))
+    """
+    mode = mode.lower()
+    if mode == "last":
+        return logits_bt[:, -1]
+    if mode == "max":
+        return logits_bt.max(dim=1).values
+
+    t = float(temperature)
+    lse = torch.logsumexp(logits_bt / t, dim=1) * t
+    if mode == "logsumexp":
+        return lse
+    if mode == "logmeanexp":
+        return lse - math.log(logits_bt.size(1))
+    raise ValueError(f"Unknown agg mode: {mode}")
+
+
+def end_weighted_bce_loss(logits_bt: torch.Tensor, y_b: torch.Tensor, pos_weight: torch.Tensor, k_last: int = 4) -> torch.Tensor:
+    """Aux BCE over last K timesteps (pushes 'now' to match the window label)."""
+    B, T = logits_bt.shape
+    k = int(min(max(k_last, 1), T))
+    logits_end = logits_bt[:, -k:]                  # (B,k)
+    y_end = y_b.view(B, 1).expand(B, k).float()     # (B,k)
+    return F.binary_cross_entropy_with_logits(logits_end, y_end, pos_weight=pos_weight, reduction="mean")
 def load_yaml(path: Path) -> Dict[str, Any]:
     import yaml
     with path.open("r", encoding="utf-8") as f:
@@ -153,8 +188,10 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device) 
     for X, y in loader:
         X = X.to(device)  # (B,T,C)
         y = y.to(device).float()  # (B,)
-        logits = model(X).view(-1)  # (B,)
-        all_logits.append(logits.detach().cpu())
+        #logits = model(X).view(-1)  # (B,)
+        logits_bt = model(X)  # (B,T)
+        win_logits = aggregate_window_logits(logits_bt)  # (B,) mode=agg_mode,  temperature=temperature
+        all_logits.append(win_logits.detach().cpu())
         all_targets.append(y.detach().cpu())
 
     logits = torch.cat(all_logits).numpy()
@@ -181,6 +218,10 @@ def train_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     grad_clip: float | None = None,
+    agg_mode="logsumexp",
+    temperature=1.0,
+    end_loss_alpha=0.5,
+    end_loss_k=4
 ) -> float:
     model.train()
     losses = []
@@ -190,8 +231,19 @@ def train_one_epoch(
         y = y.to(device).float()  # BCE expects float targets
 
         optim.zero_grad(set_to_none=True)
-        logits = model(X).view(-1)  # (B,)
-        loss = criterion(logits, y)
+        logits_bt = model(X)  # (B,T)
+
+        win_logits = aggregate_window_logits(logits_bt)  # (B,)mode=agg_mode,,  temperature=temperature
+        loss_main = criterion(win_logits, y)
+        
+        if end_loss_alpha > 0:
+            pos_weight = getattr(criterion, "pos_weight", torch.tensor(1.0, device=device))
+            loss_end = end_weighted_bce_loss(logits_bt, y, pos_weight=pos_weight, k_last=end_loss_k)
+            loss = (1 - end_loss_alpha) * loss_main + end_loss_alpha * loss_end
+        else:
+            loss = loss_main
+                #logits = model(X).view(-1)  # (B,)
+                #loss = criterion(logits, y)
         loss.backward()
 
         if grad_clip is not None:
@@ -365,13 +417,17 @@ def main() -> None:
     epochs = int(cfg["train"].get("epochs", 20))
     grad_clip = cfg["train"].get("grad_clip", None)
     grad_clip = float(grad_clip) if grad_clip is not None else None
-
+    agg_mode = cfg["train"].get("agg_mode", 'logsumexp')
+    temperature = cfg["train"].get("logsumexp_temperature", 1.0)
+    end_loss_alpha = cfg["train"].get("end_loss_alpha", 0.5)
+    end_loss_k = cfg["train"].get("end_loss_k", 4)
+    
     # 10) Train
     best_auprc = -1.0
     history = []
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optim, criterion, device, grad_clip=grad_clip)
+        train_loss = train_one_epoch(model, train_loader, optim, criterion, device, grad_clip=grad_clip, end_loss_alpha=end_loss_alpha, end_loss_k=end_loss_k)
 
         val_out = evaluate_binary(model, val_loader, device=device)
         val_auprc = val_out["auprc"]

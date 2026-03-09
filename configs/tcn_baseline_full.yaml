@@ -1,9 +1,9 @@
 exp:
-  name: tcn_baseline_RWF
+  name: tcn_causal_RWF_window_16_exclude_tens
   seed: 42
 
 paths:
-  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF # change to your real json root
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF  # change to your real json root
   runs_root: /home/anna/TCN_TRAIN/runs
 
 data:
@@ -35,6 +35,7 @@ features:
 model:
   type: "tcn"
   causal: true
+  norm: group   # group recommended for strict causality during training
   hidden_dim: 64
   num_layers: 4
   dilations: [1, 2, 4, 8]
@@ -51,8 +52,12 @@ train:
   pos_weight: 4.0
   grad_clip: 1.0
   early_stop_patience: 7
-  num_workers: 1
+  num_workers: 0
   device: cuda
+  agg_mode: logsumexp          # or logmeanexp (recommended)
+  logsumexp_temperature: 1.0
+  end_loss_alpha: 0.5          # 0.0 disables
+  end_loss_k: 4                # last 4 steps = 0.8s at 5Hz
   
 eval:
   threshold_sweep:

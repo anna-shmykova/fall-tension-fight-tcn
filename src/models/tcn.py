@@ -4,85 +4,83 @@ import torch.nn.functional as F
 from src.models.encoders import BoneMLPEncoder
 from src.models.pooling import PersonPooling
 
-class TemporalConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
-        super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
 
+class CausalConv1d(nn.Module):
+    """Conv1d with left-only padding so output[t] depends only on input[:t]."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, bias=True):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.left_pad = (self.kernel_size - 1) * self.dilation
         self.conv = nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=0,   # IMPORTANT: no symmetric padding
+            bias=bias,
         )
-        self.bn = nn.BatchNorm1d(out_channels)
 
     def forward(self, x):
-        # x: (B, C_in, T)
+        # x: (B, C, T)
+        x = F.pad(x, (self.left_pad, 0))
+        return self.conv(x)
+
+
+class TemporalConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, causal=False, norm="group"):
+        super().__init__()
+        self.causal = bool(causal)
+
+        if self.causal:
+            self.conv = CausalConv1d(in_channels, out_channels, kernel_size=kernel_size, dilation=dilation)
+        else:
+            padding = (kernel_size - 1) * dilation // 2
+            self.conv = nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+            )
+
+        # NOTE: BatchNorm1d mixes statistics across time during training.
+        # For strict causality (no training-time leakage), prefer GroupNorm.
+        if norm == "batch":
+            self.norm = nn.BatchNorm1d(out_channels)
+        elif norm == "none":
+            self.norm = nn.Identity()
+        else:
+            self.norm = nn.GroupNorm(1, out_channels)
+
+    def forward(self, x):
         out = self.conv(x)
-        out = self.bn(out)
+        out = self.norm(out)
         out = F.relu(out)
         return out
 
-class EventTCNSimple(nn.Module):
-    def __init__(self, input_dim, num_classes=1,
-                 hidden_dim=64, num_layers=3):
-        super().__init__()
-
-        layers = []
-        in_ch = input_dim
-        dilation = 1
-        for _ in range(num_layers):
-            layers.append(
-                TemporalConvBlock(
-                    in_channels=in_ch,
-                    out_channels=hidden_dim,
-                    kernel_size=3,
-                    dilation=dilation,
-                )
-            )
-            in_ch = hidden_dim
-            dilation *= 2  # 1,2,4,...
-
-        self.tcn = nn.Sequential(*layers)
-        #self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
-        self.fc = nn.Linear(hidden_dim, 1)   # <--- ONE logit
-
-    def forward(self, x):
-        # x: (B, T, C)
-        x = x.transpose(1, 2)          # (B, C, T)
-        feat = self.tcn(x)             # (B, hidden_dim, T)
-        #logits = self.head(feat)       # (B, num_classes, T)
-        #logits = logits.transpose(1, 2)  # (B, T, num_classes)
-        mid = feat.size(-1) // 2
-        last_feat = feat[:, :, mid]         # (B, hidden_dim)
-        logits = self.fc(last_feat).squeeze(-1)  # (B,)  raw score
-        return logits
 
 class EventTCN(nn.Module):
-    def __init__(self, input_dim=97, num_classes=1,
-                 hidden_dim=64, num_layers=3, kernel_size=3,
-                 mlp_out_dim=32, pool_mode="mean_max_std"):
+    def __init__(
+        self,
+        input_dim=97,
+        num_classes=1,
+        hidden_dim=64,
+        num_layers=3,
+        kernel_size=3,
+        mlp_out_dim=32,
+        pool_mode="mean_max_std",
+        causal=True,
+        norm="group",
+    ):
         super().__init__()
-
-        layers = []
         self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
         self.pool = PersonPooling(mode=pool_mode)
 
-        pool_mult = {
-            "mean": 1,
-            "max": 1,
-            "mean_max": 2,
-            "mean_max_std": 3,
-        }
-        if pool_mode not in pool_mult:
-            raise ValueError(f"Unsupported pool_mode: {pool_mode}")
-
-        # TCN input channels must match pooled scene features (+1 for count_norm)
+        pool_mult = {"mean": 1, "max": 1, "mean_max": 2, "mean_max_std": 3}
         in_ch = mlp_out_dim * pool_mult[pool_mode] + 1
 
-        #print(in_ch)
+        layers = []
         dilation = 1
         for _ in range(num_layers):
             layers.append(
@@ -91,40 +89,26 @@ class EventTCN(nn.Module):
                     out_channels=hidden_dim,
                     kernel_size=kernel_size,
                     dilation=dilation,
+                    causal=causal,
+                    norm=norm,
                 )
             )
             in_ch = hidden_dim
-            dilation *= 2  # 1,2,4,...
+            dilation *= 2
+
         self.tcn = nn.Sequential(*layers)
-        #self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
-        self.fc = nn.Linear(hidden_dim, 1)   # <--- ONE logit
+        self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
-        # x: (B, T, C)
-        # pose_xyc: (B,T,K,V,3) or (B,T,K,V,2)
-        emb, person_mask = self.mlp(x) # B,T,K,out_dim
-        
-        scene = self.pool(emb, mask=person_mask)              # (B,T,C)
-        
-        count = person_mask.sum(dim=2).float()                # (B,T)
-        count_norm = count / person_mask.size(2)              # (B,T) for K fixed
-        #print(count_norm.unsqueeze(-1).shape)
-        scene_count = torch.cat([scene, count_norm.unsqueeze(-1)], dim=-1)  # (B,T,C+1)
-        #print(scene_count.shape)
-        #B, T, K, E = x.shape
+        # x: (B, T, C)  (your BoneMLPEncoder already handles your format)
+        emb, person_mask = self.mlp(x)                      # (B,T,K,E), (B,T,K)
+        scene = self.pool(emb, mask=person_mask)            # (B,T,E_scene)
 
-        '''scene_per = (
-            scene.permute(0, 2, 1)      # (B, K, E, T)
-             .contiguous()
-             #.view(B * K, E, T)        # (B*K, E, T)
-        )'''
-        tcn_in = scene_count.transpose(1,2).contiguous()
-        feat = self.tcn(tcn_in)             # (B, hidden_dim, T)
-        #logits = self.head(feat)       # (B, num_classes, T)
-        #logits = logits.transpose(1, 2)  # (B, T, num_classes)
-        #last_feat = feat[:, :, -1]         # (B, hidden_dim)
-        mid = feat.size(-1) // 2
-        mid_feat = feat[:, :, mid]              # (B, hidden)
-        logits = self.fc(mid_feat).squeeze(-1)  # (B,)
-        #logits = self.fc(feat)#.squeeze(-1)  # (B,)  raw score
-        return logits
+        count = person_mask.sum(dim=2).float()              # (B,T)
+        count_norm = count / person_mask.size(2)            # (B,T)
+        scene_count = torch.cat([scene, count_norm.unsqueeze(-1)], dim=-1)  # (B,T,E_scene+1)
+
+        feat = self.tcn(scene_count.transpose(1, 2))        # (B, hidden, T)
+        logits = self.head(feat)                            # (B,1,T)
+
+        return logits.squeeze(1)                            # (B,T)

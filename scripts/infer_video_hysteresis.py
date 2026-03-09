@@ -17,10 +17,10 @@ from src.models.tcn import EventTCN
 
 @dataclass
 class HystCfg:
-    thr_on: float = 0.70
-    thr_off: float = 0.50
+    thr_on: float = 0.90
+    thr_off: float = 0.70
     k_on: int = 3
-    k_off: int = 5
+    k_off: int = 4
     N: int = 8
 
 
@@ -77,7 +77,7 @@ def frame_to_detection_list(results, conf_thresh: float) -> List[dict]:
 def predict_prob(model: torch.nn.Module, window_btc: torch.Tensor) -> float:
     # model returns logits (B,) :contentReference[oaicite:5]{index=5}
     logits = model(window_btc)
-    p = torch.sigmoid(logits)[0].item()
+    p = torch.sigmoid(logits)[0][-1].item()
     print(p)
     return float(p)
 
@@ -126,6 +126,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {args.video_in}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    print(fps)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -171,6 +172,7 @@ def main():
 
                 # IMPORTANT: no transpose here; EventTCN expects (B,T,C) :contentReference[oaicite:9]{index=9}
                 last_p = predict_prob(model, x)
+                
                 last_state = hyst.update(last_p)
                 did_infer = True
 
