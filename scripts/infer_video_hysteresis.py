@@ -20,8 +20,8 @@ class HystCfg:
     thr_on: float = 0.90
     thr_off: float = 0.70
     k_on: int = 3
-    k_off: int = 4
-    N: int = 8
+    k_off: int = 3
+    N: int = 6
 
 
 class Hysteresis:
@@ -43,12 +43,12 @@ class Hysteresis:
         return self.on
 
 
-def frame_to_detection_list(results, conf_thresh: float) -> List[dict]:
+def frame_to_detection_list(frame, W, H, results, conf_thresh: float) -> Tuple[np.ndarray, List[dict]]:
     det_list = []
     if results.boxes is None or results.keypoints is None:
-        return det_list
+        return frame, det_list
     if len(results.boxes) == 0:
-        return det_list
+        return frame, det_list
 
     # same logic as your JSON maker: bbox=xyxyn, key_points = (xyn + conf) flattened
     for box, kpts_norm, conf_kpts in zip(results.boxes, results.keypoints.xyn, results.keypoints.conf):
@@ -56,7 +56,10 @@ def frame_to_detection_list(results, conf_thresh: float) -> List[dict]:
         conf = float(box.conf)
         if conf < conf_thresh:
             continue
-
+        for keypoint in kpts_norm:   
+            cx = int(float(keypoint[0])*W)
+            cy = int(float(keypoint[1])*H)
+            cv2.circle(frame, (cx, cy), 2, (0, 255, 0), -1)
         # skip grouped-event classes like in your builder
         if cls_id in [3, 4]:
             continue
@@ -70,7 +73,7 @@ def frame_to_detection_list(results, conf_thresh: float) -> List[dict]:
             "bbox": [x1, y1, x2, y2],
             "key_points": kpts_xyc.flatten().tolist(),
         })
-    return det_list
+    return frame, det_list
 
 
 @torch.inference_mode()
@@ -102,7 +105,8 @@ def main():
     ap.add_argument("--k_on", type=int, default=6)
     ap.add_argument("--k_off", type=int, default=4)
     ap.add_argument("--N", type=int, default=12)
-
+    ap.add_argument("--ema_beta", type=float, default=0.85, help="EMA smoothing beta. 0 disables.")
+    
     args = ap.parse_args()
 
     device = torch.device(args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu")
@@ -126,7 +130,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {args.video_in}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    print(fps)
+    print('fps', fps)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -143,7 +147,10 @@ def main():
 
     last_p: Optional[float] = None
     last_state: bool = False
-
+    
+    ema_beta = float(args.ema_beta)
+    p_smooth: Optional[float] = None
+    
     frame_idx = -1
     while True:
         ok, frame = cap.read()
@@ -158,7 +165,8 @@ def main():
             sample_idx += 1
 
             r = yolo(frame, conf=args.conf, verbose=False)[0]
-            det_list = frame_to_detection_list(r, conf_thresh=args.conf)
+
+            frame, det_list = frame_to_detection_list(frame, W, H, r, conf_thresh=args.conf)
 
             # build vector exactly like training: frame_to_vector reads detection_list
             x_t = frame_to_vector({"detection_list": det_list}, K=args.K, num_pers_features=40)  # (1001,)
@@ -173,13 +181,23 @@ def main():
                 # IMPORTANT: no transpose here; EventTCN expects (B,T,C) :contentReference[oaicite:9]{index=9}
                 last_p = predict_prob(model, x)
                 
-                last_state = hyst.update(last_p)
+                #last_state = hyst.update(last_p)
+                # realization EMA on predictions before hysteresis
+                if ema_beta <= 0.0:
+                    p_smooth = last_p
+                elif p_smooth is None:
+                    p_smooth = last_p
+                else:
+                    p_smooth = ema_beta * p_smooth + (1.0 - ema_beta) * last_p
+                
+                last_state = hyst.update(p_smooth)  # <-- IMPORTANT: feed smoothed prob
                 did_infer = True
 
                 next_infer_sample_idx += args.stride
 
         # overlay
-        txt1 = f"p={last_p:.3f}" if last_p is not None else "p=..."
+        #txt1 = f"p={last_p:.3f}" if last_p is not None else "p=..."
+        txt1 = f"p={last_p:.3f} ps={p_smooth:.3f}" if last_p is not None else "p=..."
         txt2 = "ABNORMAL=ON" if last_state else "ABNORMAL=OFF"
         txt3 = "infer" if did_infer else ""
 

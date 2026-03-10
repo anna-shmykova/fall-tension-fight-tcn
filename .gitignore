@@ -34,7 +34,6 @@ logs/
 checkpoints/
 weights/
 artifacts/
-models/
 fixed_splits/
 
 # Common ML files
