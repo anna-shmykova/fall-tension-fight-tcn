@@ -1,9 +1,7 @@
 # src/train.py
 from __future__ import annotations
-import matplotlib.pyplot as plt
 import argparse
 import json
-import csv
 import os
 import random
 import subprocess
@@ -29,6 +27,12 @@ from src.models.tcn import MLP_POOL
 from src.utils.metrics import (
     compute_auprc,
     threshold_sweep_binary,
+    confusion_stats_at_threshold,
+    save_history_csv,
+    save_threshold_sweep_csv,
+    save_learning_curves,
+    save_confusion_matrix_image,
+    save_pr_curve_image,
 )
 
 #from sklearn.metrics import average_precision_score, precision_recall_curve
@@ -123,60 +127,6 @@ def threshold_for_precision(sweep, target_precision=0.5):
     if not candidates:
         return None
     return max(candidates, key=lambda r: r["recall"])
-    
-def save_history_csv(out_dir: Path, history: list):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "metrics.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
-        writer.writeheader()
-        writer.writerows(history)
-
-def save_threshold_sweep_csv(metrics_dir: Path, sweep: list):
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = metrics_dir / "threshold_sweep.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(sweep[0].keys()))
-        w.writeheader()
-        w.writerows(sweep)
-        
-def save_learning_curves(out_dir: Path, history: list):
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    epoch_list = [h["epoch"] for h in history]
-    train_loss_list = [h["train_loss"] for h in history]
-    val_auprc_list = [h["val_auprc"] for h in history]
-    lr_list = [h["lr"] for h in history]
-
-    # Train loss
-    plt.figure()
-    plt.plot(epoch_list, train_loss_list)
-    plt.xlabel("Epoch")
-    plt.ylabel("Train loss")
-    plt.title("Training Loss")
-    plt.grid(True)
-    plt.savefig(out_dir / "train_loss.png", dpi=150)
-    plt.close()
-
-    # Val AUPRC
-    plt.figure()
-    plt.plot(epoch_list, val_auprc_list)
-    plt.xlabel("Epoch")
-    plt.ylabel("Val AUPRC")
-    plt.title("Validation AUPRC")
-    plt.grid(True)
-    plt.savefig(out_dir / "val_auprc.png", dpi=150)
-    plt.close()
-
-    # LR
-    plt.figure()
-    plt.plot(epoch_list, lr_list)
-    plt.xlabel("Epoch")
-    plt.ylabel("Learning rate")
-    plt.title("Learning Rate")
-    plt.grid(True)
-    plt.savefig(out_dir / "lr.png", dpi=150)
-    plt.close()
 
 # ----------------------------
 # Training / Eval loops
@@ -202,12 +152,29 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device) 
     probs = 1 / (1 + np.exp(-logits))
     auprc = compute_auprc(targets, probs)
 
+    pos_mask = targets == 1
+    neg_mask = targets == 0
+    mean_prob_pos = float(np.mean(probs[pos_mask])) if np.any(pos_mask) else float("nan")
+    mean_prob_neg = float(np.mean(probs[neg_mask])) if np.any(neg_mask) else float("nan")
+
     sweep = threshold_sweep_binary(targets, probs, start=0.01, end=0.99, step=0.01)
     best = max(sweep, key=lambda r: r["f1"])
+    best_threshold_stats = confusion_stats_at_threshold(targets, probs, threshold=float(best["threshold"]))
+    fixed_thresholds = {
+        "0.3": confusion_stats_at_threshold(targets, probs, threshold=0.3),
+        "0.5": confusion_stats_at_threshold(targets, probs, threshold=0.5),
+        "0.7": confusion_stats_at_threshold(targets, probs, threshold=0.7),
+    }
 
     return {
         "auprc": float(auprc),
         "best_f1": {k: float(v) for k, v in best.items()},
+        "best_threshold_stats": best_threshold_stats,
+        "mean_prob_pos": mean_prob_pos,
+        "mean_prob_neg": mean_prob_neg,
+        "fixed_thresholds": fixed_thresholds,
+        "targets": targets.tolist(),
+        "probs": probs.tolist(),
         "n_samples": int(len(targets)),
         "sweep": sweep,  # list of dicts
     }
@@ -439,14 +406,33 @@ def main() -> None:
 
         # IMPORTANT: read LR AFTER scheduler.step
         lr = optim.param_groups[0]["lr"]
-        
-        print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_auprc={val_auprc:.4f} | bestF1={val_out['best_f1']} | lr={lr:.2e}")
+
+        fixed03 = val_out["fixed_thresholds"]["0.3"]
+        fixed05 = val_out["fixed_thresholds"]["0.5"]
+        fixed07 = val_out["fixed_thresholds"]["0.7"]
+        print(
+            f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_auprc={val_auprc:.4f} "
+            f"| bestF1={val_out['best_f1']} | mean_p(pos)={val_out['mean_prob_pos']:.3f} "
+            f"| mean_p(neg)={val_out['mean_prob_neg']:.3f} | thr0.5 F1={fixed05['f1']:.3f} "
+            f"(P={fixed05['precision']:.3f}, R={fixed05['recall']:.3f}) | lr={lr:.2e}"
+        )
         
         history.append({
             "epoch": epoch,
             "train_loss": train_loss,
             "val_auprc": val_auprc,
             "best_f1": val_out["best_f1"],
+            "mean_prob_pos": float(val_out["mean_prob_pos"]),
+            "mean_prob_neg": float(val_out["mean_prob_neg"]),
+            "thr_03_f1": float(fixed03["f1"]),
+            "thr_03_precision": float(fixed03["precision"]),
+            "thr_03_recall": float(fixed03["recall"]),
+            "thr_05_f1": float(fixed05["f1"]),
+            "thr_05_precision": float(fixed05["precision"]),
+            "thr_05_recall": float(fixed05["recall"]),
+            "thr_07_f1": float(fixed07["f1"]),
+            "thr_07_precision": float(fixed07["precision"]),
+            "thr_07_recall": float(fixed07["recall"]),
             "lr": float(lr),
         })
 
@@ -480,6 +466,10 @@ def main() -> None:
                         "val_details": {
                             "auprc": val_out["auprc"],
                             "best_f1": val_out["best_f1"],
+                            "best_threshold_stats": val_out["best_threshold_stats"],
+                            "mean_prob_pos": val_out["mean_prob_pos"],
+                            "mean_prob_neg": val_out["mean_prob_neg"],
+                            "fixed_thresholds": val_out["fixed_thresholds"],
                             "n_samples": val_out["n_samples"],
                         },
                     },
@@ -493,6 +483,24 @@ def main() -> None:
             sweep = val_out.get("sweep", None)
             if sweep:
                 save_threshold_sweep_csv(metrics_dir, sweep)
+
+            save_confusion_matrix_image(
+                reports_dir / "cm_norm_thr_0.5.png",
+                val_out["fixed_thresholds"]["0.5"],
+                title="Validation Confusion Matrix (normalized) @ thr=0.5",
+            )
+            best_thr = float(val_out["best_f1"]["threshold"])
+            save_confusion_matrix_image(
+                reports_dir / "cm_norm_thr_best_f1.png",
+                val_out["best_threshold_stats"],
+                title=f"Validation Confusion Matrix (normalized) @ thr={best_thr:.2f}",
+            )
+            save_pr_curve_image(
+                reports_dir / "pr_curve_val.png",
+                y_true=np.asarray(val_out["targets"], dtype=np.float32),
+                y_prob=np.asarray(val_out["probs"], dtype=np.float32),
+                title="Validation Precision-Recall Curve",
+            )
     
             # Plots for best checkpoint moment (optional)
             save_learning_curves(reports_dir, history)
