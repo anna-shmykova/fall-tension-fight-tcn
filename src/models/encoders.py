@@ -177,4 +177,4 @@ class BoneMLPEncoder(nn.Module):
         #print(x.shape)
         emb = self.mlp(x) # (B,T,K,out_dim)
         #print(emb.shape)
-        return emb, person_mask
+        return emb, person_mask, pers_bboxes

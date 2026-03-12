@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from src.models.encoders import BoneMLPEncoder
 from src.models.pooling import PersonPooling
-
+from src.models.graph import InterpersonalGraph
 
 class CausalConv1d(nn.Module):
     """Conv1d with left-only padding so output[t] depends only on input[:t]."""
@@ -62,19 +62,26 @@ class TemporalConvBlock(nn.Module):
 
 class EventTCN(nn.Module):
     def __init__(
-        self,
-        input_dim=97,
-        num_classes=1,
-        hidden_dim=64,
-        num_layers=3,
-        kernel_size=3,
-        mlp_out_dim=32,
-        pool_mode="mean_max_std",
-        causal=True,
-        norm="group",
-    ):
+                    self,
+                    input_dim=97,
+                    num_classes=1,
+                    hidden_dim=64,
+                    num_layers=3,
+                    kernel_size=3,
+                    mlp_out_dim=32,
+                    pool_mode="mean_max_std",
+                    causal=True,
+                    norm="group",
+                ):
         super().__init__()
         self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
+        self.graph = InterpersonalGraph(
+                                            dim=mlp_out_dim,
+                                            k_nn=2,
+                                            radius=2.5,
+                                            hidden=hidden_dim,
+                                            dropout=0.1,
+                                        )
         self.pool = PersonPooling(mode=pool_mode)
 
         pool_mult = {"mean": 1, "max": 1, "mean_max": 2, "mean_max_std": 3}
@@ -101,8 +108,9 @@ class EventTCN(nn.Module):
 
     def forward(self, x):
         # x: (B, T, C)  (your BoneMLPEncoder already handles your format)
-        emb, person_mask = self.mlp(x)                      # (B,T,K,E), (B,T,K)
-        scene = self.pool(emb, mask=person_mask)            # (B,T,E_scene)
+        emb, person_mask, person_bboxes = self.mlp(x)          # (B,T,N,E), (B,T,N), (B,T,N,4)
+        emb = self.graph(emb, person_bboxes, person_mask)      # (B,T,N,E)
+        scene = self.pool(emb, mask=person_mask)               # (B,T,E_scene)
 
         count = person_mask.sum(dim=2).float()              # (B,T)
         count_norm = count / person_mask.size(2)            # (B,T)

@@ -130,7 +130,7 @@ def threshold_for_precision(sweep, target_precision=0.5):
 # Training / Eval loops
 # ----------------------------
 @torch.no_grad()
-def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, Any]:
+def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device, agg_mode="logsumexp", temperature=1.0,) -> Dict[str, Any]:
     model.eval()
     all_logits = []
     all_targets = []
@@ -140,7 +140,7 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device) 
         y = y.to(device).float()  # (B,)
         #logits = model(X).view(-1)  # (B,)
         logits_bt = model(X)  # (B,T)
-        win_logits = aggregate_window_logits(logits_bt)  # (B,) mode=agg_mode,  temperature=temperature
+        win_logits = aggregate_window_logits(logits_bt, mode=agg_mode, temperature=temperature)  # (B,) 
         all_logits.append(win_logits.detach().cpu())
         all_targets.append(y.detach().cpu())
 
@@ -200,7 +200,12 @@ def train_one_epoch(
         optim.zero_grad(set_to_none=True)
         logits_bt = model(X)  # (B,T)
 
-        win_logits = aggregate_window_logits(logits_bt)  # (B,)mode=agg_mode,,  temperature=temperature
+        #win_logits = aggregate_window_logits(logits_bt)  # (B,)mode=agg_mode,,  temperature=temperature
+        win_logits = aggregate_window_logits(
+                                                logits_bt,
+                                                mode=agg_mode,
+                                                temperature=temperature,
+                                            )
         loss_main = criterion(win_logits, y)
         
         if end_loss_alpha > 0:
@@ -394,9 +399,14 @@ def main() -> None:
     history = []
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optim, criterion, device, grad_clip=grad_clip, end_loss_alpha=end_loss_alpha, end_loss_k=end_loss_k)
+        train_loss = train_one_epoch(
+                                        model, train_loader, optim, criterion, device, grad_clip=grad_clip, 
+                                        end_loss_alpha=end_loss_alpha, end_loss_k=end_loss_k, 
+                                        agg_mode=agg_mode,
+                                        temperature=temperature,
+                                    )
 
-        val_out = evaluate_binary(model, val_loader, device=device)
+        val_out = evaluate_binary(model, val_loader, device=device, agg_mode=agg_mode, temperature=temperature)
         val_auprc = val_out["auprc"]
 
         # Step scheduler (ReduceLROnPlateau expects metric)
