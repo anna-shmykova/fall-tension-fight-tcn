@@ -9,7 +9,7 @@ class InterpersonalGraph(nn.Module):
     person_mask: [B, T, N] bool
     returns:     [B, T, N, D]
     """
-    def __init__(self, dim, k_nn=2, radius=2.5, hidden=64, dropout=0.1):
+    def __init__(self, dim, k_nn=4, radius=2.5, hidden=64, dropout=0.1):
         super().__init__()
         self.dim = dim
         self.k_nn = k_nn

@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_graph_RWF_window_16_exclude_tens
+  name: tcn_causal_last_aggr_graph_attent_readout_RWF_window_16_exclude_tens
   seed: 42
 
 paths:
@@ -54,7 +54,7 @@ train:
   early_stop_patience: 7
   num_workers: 0
   device: cuda
-  agg_mode: logsumexp          # or logmeanexp (recommended)
+  agg_mode: last #logsumexp          # or logmeanexp (recommended)
   logsumexp_temperature: 1.0
   end_loss_alpha: 0.5          # 0.0 disables
   end_loss_k: 4                # last 4 steps = 0.8s at 5Hz

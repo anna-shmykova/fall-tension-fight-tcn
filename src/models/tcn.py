@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.encoders import BoneMLPEncoder
-from src.models.pooling import PersonPooling
+from src.models.pooling import PersonPooling, AttentionReadout
 from src.models.graph import InterpersonalGraph
 
 class CausalConv1d(nn.Module):
@@ -69,7 +69,7 @@ class EventTCN(nn.Module):
                     num_layers=3,
                     kernel_size=3,
                     mlp_out_dim=32,
-                    pool_mode="mean_max_std",
+                    pool_mode="attn",
                     causal=True,
                     norm="group",
                 ):
@@ -82,9 +82,26 @@ class EventTCN(nn.Module):
                                             hidden=hidden_dim,
                                             dropout=0.1,
                                         )
-        self.pool = PersonPooling(mode=pool_mode)
-
-        pool_mult = {"mean": 1, "max": 1, "mean_max": 2, "mean_max_std": 3}
+        if not pool_mode == "attn":
+            self.pool = PersonPooling(
+                                    mode=pool_mode,
+                                    emb_dim=mlp_out_dim,
+                                    attn_hidden_dim=mlp_out_dim,
+                                    dropout=0.1,
+                                )
+        else: 
+            self.pool = AttentionReadout(
+                                        emb_dim=mlp_out_dim,
+                                        hidden_dim=32,
+                                        dropout=0.1
+                                      )
+        pool_mult = {
+                        "mean": 1,
+                        "max": 1,
+                        "mean_max": 2,
+                        "mean_max_std": 3,
+                        "attn": 1,
+                    }
         in_ch = mlp_out_dim * pool_mult[pool_mode] + 1
 
         layers = []
@@ -110,8 +127,8 @@ class EventTCN(nn.Module):
         # x: (B, T, C)  (your BoneMLPEncoder already handles your format)
         emb, person_mask, person_bboxes = self.mlp(x)          # (B,T,N,E), (B,T,N), (B,T,N,4)
         emb = self.graph(emb, person_bboxes, person_mask)      # (B,T,N,E)
-        scene = self.pool(emb, mask=person_mask)               # (B,T,E_scene)
-
+        scene,_ = self.pool(emb, mask=person_mask)               # (B,T,E_scene)
+        #print(scene.shape)
         count = person_mask.sum(dim=2).float()              # (B,T)
         count_norm = count / person_mask.size(2)            # (B,T)
         scene_count = torch.cat([scene, count_norm.unsqueeze(-1)], dim=-1)  # (B,T,E_scene+1)

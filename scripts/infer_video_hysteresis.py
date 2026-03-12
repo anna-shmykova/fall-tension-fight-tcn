@@ -100,11 +100,11 @@ def main():
     ap.add_argument("--win", type=int, default=16)
     ap.add_argument("--stride", type=int, default=1)
 
-    ap.add_argument("--thr_on", type=float, default=0.85)
-    ap.add_argument("--thr_off", type=float, default=0.50)
-    ap.add_argument("--k_on", type=int, default=6)
-    ap.add_argument("--k_off", type=int, default=4)
-    ap.add_argument("--N", type=int, default=12)
+    ap.add_argument("--thr_on", type=float, default=0.9)
+    ap.add_argument("--thr_off", type=float, default=0.7)
+    ap.add_argument("--k_on", type=int, default=3)
+    ap.add_argument("--k_off", type=int, default=3)
+    ap.add_argument("--N", type=int, default=6)
     ap.add_argument("--ema_beta", type=float, default=0.85, help="EMA smoothing beta. 0 disables.")
     
     args = ap.parse_args()
