@@ -1,0 +1,57 @@
+exp:
+  name: tcn_causal_erez_motion_RWF_window_16_fixed_split
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF
+  runs_root: /home/anna/TCN_TRAIN/runs
+
+data:
+  label_mode: "binary_tension"
+  window_size: 16
+  window_step: 4
+  fps: 25
+  sample_every_n_frames: 5
+  max_persons: 25
+
+  split:
+    mode: "fixed" #"generate"
+    group_key: "video_id"
+    seed: 42
+    val_ratio: 0.2
+    train_list: "fixed_splits/train_paths.txt"
+    val_list: "fixed_splits/val_paths.txt"
+
+features:
+  type: erez_motion
+  erez_json_version: 2.0
+
+model:
+  type: motion_tcn
+  causal: true
+  norm: group
+  hidden_dim: 64
+  num_layers: 4
+  kernel_size: 3
+  input_proj_dim: 32
+
+train:
+  batch_size: 32
+  epochs: 15
+  lr: 0.0005
+  weight_decay: 0.0001
+  pos_weight: 4.0
+  grad_clip: 1.0
+  early_stop_patience: 7
+  num_workers: 0
+  device: cuda
+  agg_mode: logsumexp
+  logsumexp_temperature: 1.0
+  end_loss_alpha: 0.5
+  end_loss_k: 4
+
+eval:
+  threshold_sweep:
+    start: 0.01
+    end: 0.99
+    step: 0.01

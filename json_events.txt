@@ -1,0 +1,161 @@
+VIDEO: video/1_1/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:07.0-0:42.2,0:44.0-0:45.2
+
+VIDEO: video/8_6/1.mp4 not good
+FPS: 25.0  STEP: 5
+  fight: 0:00.0-0:02.2
+
+VIDEO: video/8_6/3.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:00.0-0:25.0
+
+VIDEO: video/3_6/1.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:03.0-0:07.2
+
+VIDEO: video/3_6/2.mp4
+FPS: 25.0  STEP: 5
+  tension: 1:26.0-2:13.0
+  fight: 2:13.0-2:26.2
+
+VIDEO: video/3_6/4.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:01.0-0:44.2
+
+VIDEO: video/3_6/5.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:03.0-0:07.2
+  fight: 0:07.0-0:15.2
+
+VIDEO: video/3_6/6.mp4 far camera
+FPS: 30.0  STEP: 5
+  fight: 0:07.0-0:27.2
+
+VIDEO: video/4_1/1.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:02.0-0:10.2
+
+VIDEO: video/5_4/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:03.0-0:04.2
+  fight: 0:04.0-0:12.2
+
+VIDEO: video/5_4/2.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:04.0-0:15.2,0:37.0-0:39.2
+  fight: 0:15.0-0:34.2
+
+VIDEO: video/5_4/3.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:10.0-0:15.0
+  fight: 0:07.0-0:09.2,0:15.0-1:04.2
+
+VIDEO: video/6_11/1.mp4
+FPS: 15.0  STEP: 5
+  tension: 0:27.0-2:46.3
+
+VIDEO: video/6_11/2.mp4
+FPS: 15.0  STEP: 5
+  tension: 0:31.0-3:34.3,6:02.0-6:16.3,6:45.0-6:52.3
+
+VIDEO: video/6_11/4.mp4
+FPS: 15.0  STEP: 5
+  tension: 0:08.0-0:40.3,0:48.0-2:23.3
+
+VIDEO: video/6_11/5.mp4
+FPS: 15.0  STEP: 5
+  tension: 0:14.0-0:42.3,0:46.0-3:07.3,6:38.0-8:26.3,9:31.0-9:39.3,12:25.0-12:29.3
+  fight: 8:26.0-8:46.3
+
+VIDEO: video/6_11/6.mp4
+FPS: 15.0  STEP: 5
+  tension: 3:33.0-3:44.3,3:50.0-5:14.3,6:18.0-6:29.3,9:12.0-9:14.3
+  fight: 5:14.0-5:29.3
+
+VIDEO: video/6_11/7.mp4
+FPS: 15.0  STEP: 5
+  tension: 2:10.0-2:23.3,2:31.0-3:32.3,4:38.0-4:42.3,8:03.0-8:05.3,8:52.0-9:29.3,10:05.0-12:14.3,12:42.0-13:02.3,13:33.0-14:17.3,14:24.0-14:29.3,14:35.0-14:48.3,15:13.0-15:31.3,15:41.0-15:57.3,16:30.0-16:43.3,17:10.0-17:16.3
+  fight: 2:23.0-2:31.3,8:40.0-8:52.3
+
+VIDEO: video/6_11/8.mp4
+FPS: 15.0  STEP: 5
+  tension: 2:58.0-3:10.3,3:13.0-4:08.3,4:15.0-5:09.3,5:10.0-6:03.3,9:20.0-12:38.3,12:49.0-15:14.3
+  fight: 4:08.0-4:15.3,12:39.0-12:48.3
+
+VIDEO: video/6_11/9.mp4
+FPS: 15.0  STEP: 5
+  tension: 0:42.0-3:53.3,6:54.0-10:21.3,10:27.0-12:58.3,13:26.0-13:41.3,14:41.0-15:27.3
+  fight: 0:34.0-0:42.3,10:21.0-10:27.3
+
+VIDEO: video/7_7/3.mp4
+FPS: 50.0  STEP: 5
+  tension: 0:25.0-1:18.9
+
+VIDEO: video/7_7/7.mp4
+FPS: 50.0  STEP: 5
+  tension: 0:09.0-0:50.8
+
+VIDEO: video/8_6/2.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:00.0-0:14.2
+
+VIDEO: video/8_6/4.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:02.0-0:07.2
+  fight: 0:07.0-0:16.2
+
+VIDEO: video/8_6/5.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:20.0-0:26.2
+
+VIDEO: video/8_6/6.mp4
+FPS: 25.0  STEP: 5
+  fight: 0:17.0-0:22.2
+
+VIDEO: video/9_4/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:56.0-0:57.2,1:51.0-1:53.2
+  fight: 0:15.0-0:39.2
+
+VIDEO: video/9_4/4.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:00.0-0:03.2,0:16.0-0:28.2,1:15.0-1:17.2,1:23.0-1:41.2,5:00.0-5:22.2,5:56.0-7:04.2,7:15.0-7:35.2
+  fight: 1:17.0-1:23.2
+
+VIDEO: video/new_amir/17/2.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:12.0-1:27.0,1:28.2-1:46.4
+  fight: 1:27.0-1:28.2
+
+VIDEO: video/new_amir/21/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:06.0-0:21.0,0:50.0-1:10.2
+  fight: 0:21.0-0:46.2
+  fall: 46-1:55
+
+VIDEO: video/new_amir/2_double/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:00.0-0:28.2,0:37.0-0:57.2,1:09.0-1:15.6
+
+VIDEO: video/new_amir/2_double/2.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:13.0-0:15.0,0:21.0-0:28.0
+  fight: 0:03.0-0:08.2,0:15.0-0:20.2
+
+VIDEO: video/new_amir/9/1.mp4
+FPS: 25.0  STEP: 5
+  tension: 0:03.0-0:07.2,0:28.2-0:40.2,0:50.0-0:55.0
+  fight: 0:08.0-0:28.2
+
+VIDEO: video/2_1/1.mp4
+FPS: 15.0  STEP: 5
+
+VIDEO: video/usual/cam2.mp4
+FPS: 15.009533720923951  STEP: 5
+
+VIDEO: video/usual/cam501_1.mp4
+FPS: 15.076923076923077  STEP: 5
+
+VIDEO: video/usual/cam6.mp4
+FPS: 14.999369861183517  STEP: 5
