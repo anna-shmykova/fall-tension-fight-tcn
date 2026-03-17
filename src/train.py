@@ -25,7 +25,7 @@ from src.data.splits import (
     write_split_files
     )
 from src.data.dataset import EventJsonDataset
-from src.models.tcn import EventTCN
+from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
     compute_auprc,
     threshold_sweep_binary,
@@ -345,6 +345,7 @@ def main() -> None:
 
     feature_cfg = cfg.get("features", {})
     label_cfg = cfg.get("labels", {})
+    feature_type = str(feature_cfg.get("type", "pose_flat")).lower()
 
     train_ds = EventJsonDataset(
         train_paths,
@@ -368,6 +369,7 @@ def main() -> None:
     print(f"[INFO] run_dir:   {run_dir}")
     print(f"[INFO] jsons:     {len(all_jsons)} total | {len(train_paths)} train_jsons | {len(val_paths)} val_jsons")
     print(f"[INFO] windows:   {len(train_ds)} train_windows | {len(val_ds)} val_windows")
+    print(f"[INFO] features:  {feature_type}")
 
     # 7) Dataloaders
     bs = int(cfg["train"].get("batch_size", 64))
@@ -384,15 +386,36 @@ def main() -> None:
     print(f"[INFO] data_shape X, y: {X0.shape}, {y0.shape}")
 
     model_cfg = cfg.get("model", {})
-    model = EventTCN(
-        input_dim=C,
-        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
-        num_layers=int(model_cfg.get("num_layers", 4)),
-        #dilations=list(model_cfg.get("dilations", [1, 2, 4, 8])),
-        kernel_size=int(model_cfg.get("kernel_size", 3)),
-        #dropout=float(model_cfg.get("dropout", 0.2)),
-        #causal=bool(model_cfg.get("causal", True)),
-    )
+    model_type = str(model_cfg.get("type", "tcn")).lower()
+    causal = bool(model_cfg.get("causal", True))
+    norm = str(model_cfg.get("norm", "group"))
+
+    if model_type in {"tcn", "event_tcn", "pose_tcn"}:
+        if feature_type in {"erez_motion", "motion", "motion_erez"}:
+            raise ValueError("EventTCN expects pose/person features, not erez motion features. Use model.type=motion_tcn.")
+        model = EventTCN(
+            input_dim=C,
+            hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+            num_layers=int(model_cfg.get("num_layers", 4)),
+            kernel_size=int(model_cfg.get("kernel_size", 3)),
+            mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+            pool_mode=str(model_cfg.get("pool_mode", "mean_max_std")),
+            causal=causal,
+            norm=norm,
+        )
+    elif model_type in {"motion_tcn", "erez_motion_tcn"}:
+        model = MotionTCN(
+            input_dim=C,
+            hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+            num_layers=int(model_cfg.get("num_layers", 4)),
+            kernel_size=int(model_cfg.get("kernel_size", 3)),
+            causal=causal,
+            norm=norm,
+            input_proj_dim=int(model_cfg.get("input_proj_dim", 0)),
+        )
+    else:
+        raise ValueError(f"Unsupported model.type: {model_type}")
+    print(f"[INFO] model:     {model_type}")
     
     device_str = cfg["train"].get("device", "cpu")
     device = torch.device("cuda" if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")
