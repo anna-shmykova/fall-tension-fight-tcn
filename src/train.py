@@ -22,9 +22,9 @@ from src.data.splits import (
     split_paths,
     write_split_files
     )
-from src.data.dataset import EventJsonDataset
+from src.data.dataset import EventJsonDataset, MotionJsonDataset
 from src.data.features import motion_feature_dim
-from src.models.tcn import EventTCN
+from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
     compute_auprc,
     threshold_sweep_binary,
@@ -318,9 +318,12 @@ def main() -> None:
 
     feature_cfg = cfg.get("features", {})
     label_cfg = cfg.get("labels", {})
+    model_cfg = cfg.get("model", {})
+    model_type = str(model_cfg.get("type", "tcn")).lower()
     motion_dim = motion_feature_dim(feature_cfg)
+    dataset_cls = MotionJsonDataset if model_type in {"motion_tcn", "erez_motion_tcn"} else EventJsonDataset
 
-    train_ds = EventJsonDataset(
+    train_ds = dataset_cls(
         train_paths,
         K=K,
         window_size=window_size,
@@ -328,7 +331,7 @@ def main() -> None:
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
     )
-    val_ds = EventJsonDataset(
+    val_ds = dataset_cls(
         val_paths,
         K=K,
         window_size=window_size,
@@ -357,34 +360,44 @@ def main() -> None:
     print(C)
     print(f"[INFO] data_shape X, y: {X0.shape}, {y0.shape}")
 
-    model_cfg = cfg.get("model", {})
     tcn_input_mode = str(model_cfg.get("tcn_input_mode", "pooled_count"))
     motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
     use_attention_readout = model_cfg.get("use_attention_readout", None)
     use_graph = bool(model_cfg.get("use_graph", True))
 
-    if tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
+    if model_type not in {"motion_tcn", "erez_motion_tcn"} and tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
         raise ValueError(
             "model.tcn_input_mode='pooled_count_motion' requires motion features. "
             "Set features.motion.enabled=true or change model.tcn_input_mode to 'pooled_count'."
         )
 
-    model = EventTCN(
-        input_dim=C,
-        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
-        num_layers=int(model_cfg.get("num_layers", 4)),
-        kernel_size=int(model_cfg.get("kernel_size", 3)),
-        mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
-        pool_mode=str(model_cfg.get("pool_mode", "attn")),
-        use_attention_readout=use_attention_readout,
-        use_graph=use_graph,
-        causal=bool(model_cfg.get("causal", True)),
-        norm=str(model_cfg.get("norm", "group")),
-        dropout=float(model_cfg.get("dropout", 0.1)),
-        motion_dim=motion_dim,
-        motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
-        tcn_input_mode=tcn_input_mode,
-    )
+    if model_type in {"motion_tcn", "erez_motion_tcn"}:
+        model = MotionTCN(
+            input_dim=C,
+            hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+            num_layers=int(model_cfg.get("num_layers", 4)),
+            kernel_size=int(model_cfg.get("kernel_size", 3)),
+            causal=bool(model_cfg.get("causal", True)),
+            norm=str(model_cfg.get("norm", "group")),
+            input_proj_dim=int(model_cfg.get("input_proj_dim", 0)),
+        )
+    else:
+        model = EventTCN(
+            input_dim=C,
+            hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+            num_layers=int(model_cfg.get("num_layers", 4)),
+            kernel_size=int(model_cfg.get("kernel_size", 3)),
+            mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+            pool_mode=str(model_cfg.get("pool_mode", "attn")),
+            use_attention_readout=use_attention_readout,
+            use_graph=use_graph,
+            causal=bool(model_cfg.get("causal", True)),
+            norm=str(model_cfg.get("norm", "group")),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+            motion_dim=motion_dim,
+            motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
+            tcn_input_mode=tcn_input_mode,
+        )
     
     device_str = cfg["train"].get("device", "cpu")
     device = torch.device("cuda" if (device_str == "cuda" and torch.cuda.is_available()) else "cpu")

@@ -199,3 +199,54 @@ class EventTCN(nn.Module):
         logits = self.head(feat)                            # (B,1,T)
 
         return logits.squeeze(1)                            # (B,T)
+
+
+class MotionTCN(nn.Module):
+    def __init__(
+                    self,
+                    input_dim=18,
+                    num_classes=1,
+                    hidden_dim=64,
+                    num_layers=4,
+                    kernel_size=3,
+                    causal=True,
+                    norm="group",
+                    input_proj_dim=0,
+                ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+
+        proj_dim = int(input_proj_dim or 0)
+        if proj_dim > 0:
+            self.input_proj = nn.Linear(self.input_dim, proj_dim)
+            in_ch = proj_dim
+        else:
+            self.input_proj = None
+            in_ch = self.input_dim
+
+        layers = []
+        dilation = 1
+        for _ in range(num_layers):
+            layers.append(
+                TemporalConvBlock(
+                    in_channels=in_ch,
+                    out_channels=hidden_dim,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    causal=causal,
+                    norm=norm,
+                )
+            )
+            in_ch = hidden_dim
+            dilation *= 2
+
+        self.tcn = nn.Sequential(*layers)
+        self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+
+        feat = self.tcn(x.transpose(1, 2))
+        logits = self.head(feat)
+        return logits.squeeze(1)

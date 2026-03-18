@@ -1,23 +1,22 @@
 from src.data.build_sequence import build_sequence
 from src.data.json_io import read_json_frames
+from src.data.motion_sequence import build_motion_sequence
 from torch.utils.data import Dataset
 import numpy as np
 import torch
 
-class EventJsonDataset(Dataset):
-    def __init__(self, json_paths, K,
+class _BaseWindowDataset(Dataset):
+    def __init__(self, json_paths, K, sequence_builder,
                  window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
         self.samples = []
         self.window_size = window_size
         self.window_step = window_step
         self.K = K
         self.feature_cfg = feature_cfg or {}
-        #self.img_w = img_w
-        #self.img_h = img_h
 
         for path in json_paths:
             frame = read_json_frames(path)
-            X_seq, y_seq = build_sequence(frame, K, feature_cfg=self.feature_cfg)
+            X_seq, y_seq = sequence_builder(frame, K, feature_cfg=self.feature_cfg)
             N = len(X_seq)
             if N < window_size:
                 continue
@@ -49,7 +48,36 @@ class EventJsonDataset(Dataset):
 
     def __getitem__(self, idx):
         X_win, y_last = self.samples[idx]
-        # convert to tensors here
         X_win = torch.from_numpy(X_win)        # (T, C)
         y_last = torch.tensor(y_last)        # (1,)
         return X_win, y_last
+
+
+class EventJsonDataset(_BaseWindowDataset):
+    def __init__(self, json_paths, K,
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
+        super().__init__(
+            json_paths=json_paths,
+            K=K,
+            sequence_builder=lambda frames, K, feature_cfg: build_sequence(frames, K, feature_cfg=feature_cfg),
+            window_size=window_size,
+            window_step=window_step,
+            feature_cfg=feature_cfg,
+            label_cfg=label_cfg,
+            window_cfg=window_cfg,
+        )
+
+
+class MotionJsonDataset(_BaseWindowDataset):
+    def __init__(self, json_paths, K,
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
+        super().__init__(
+            json_paths=json_paths,
+            K=K,
+            sequence_builder=lambda frames, K, feature_cfg: build_motion_sequence(frames, feature_cfg=feature_cfg),
+            window_size=window_size,
+            window_step=window_step,
+            feature_cfg=feature_cfg,
+            label_cfg=label_cfg,
+            window_cfg=window_cfg,
+        )
