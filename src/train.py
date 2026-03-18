@@ -364,7 +364,10 @@ def main() -> None:
     use_graph = bool(model_cfg.get("use_graph", True))
 
     if tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
-        raise ValueError("model.tcn_input_mode='pooled_count_motion' requires features.motion.enabled=true")
+        raise ValueError(
+            "model.tcn_input_mode='pooled_count_motion' requires motion features. "
+            "Set features.motion.enabled=true or change model.tcn_input_mode to 'pooled_count'."
+        )
 
     model = EventTCN(
         input_dim=C,
