@@ -38,6 +38,8 @@ features:
 
 model:
   type: "tcn"
+  use_graph: true
+  use_attention_readout: false   # true forces attn; false uses pool_mode below
   causal: true
   norm: group   # group recommended for strict causality during training
   hidden_dim: 64
@@ -46,7 +48,7 @@ model:
   kernel_size: 3
   dropout: 0.2
   mlp_out_dim: 32
-  pool_mode: mean_max_std   # choices: mean, max, mean_max, mean_max_std, attn
+  pool_mode: mean_max_std   # choices when attention is off: mean, max, mean_max, mean_max_std
   tcn_input_mode: pooled_count   # choices: pooled_count, pooled_count_motion
   motion_proj_dim: 32
 

@@ -28,7 +28,9 @@ labels:
   drop_mixed_windows: true
 
 model:
-  pool_mode: attn
+  use_graph: true
+  use_attention_readout: true
+  pool_mode: mean_max_std
   tcn_input_mode: pooled_count
   motion_proj_dim: 32
 

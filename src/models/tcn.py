@@ -5,6 +5,25 @@ from src.models.encoders import BoneMLPEncoder
 from src.models.pooling import PersonPooling
 from src.models.graph import InterpersonalGraph
 
+
+VALID_POOL_MODES = {"mean", "max", "mean_max", "mean_max_std", "attn"}
+DEFAULT_NON_ATTN_POOL_MODE = "mean_max_std"
+
+
+def resolve_pool_mode(pool_mode="attn", use_attention_readout=None):
+    pool_mode = str(pool_mode)
+
+    if use_attention_readout is True:
+        effective_pool_mode = "attn"
+    elif use_attention_readout is False:
+        effective_pool_mode = DEFAULT_NON_ATTN_POOL_MODE if pool_mode == "attn" else pool_mode
+    else:
+        effective_pool_mode = pool_mode
+
+    if effective_pool_mode not in VALID_POOL_MODES:
+        raise ValueError(f"Unsupported pool_mode: {effective_pool_mode}")
+    return effective_pool_mode
+
 class CausalConv1d(nn.Module):
     """Conv1d with left-only padding so output[t] depends only on input[:t]."""
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, bias=True):
@@ -69,7 +88,9 @@ class EventTCN(nn.Module):
                     num_layers=3,
                     kernel_size=3,
                     mlp_out_dim=32,
-                    pool_mode="mean_max_std",
+                    pool_mode="attn",
+                    use_attention_readout=None,
+                    use_graph=True,
                     causal=True,
                     norm="group",
                     dropout=0.1,
@@ -81,19 +102,26 @@ class EventTCN(nn.Module):
         self.input_dim = int(input_dim)
         self.motion_dim = int(motion_dim)
         self.tcn_input_mode = str(tcn_input_mode)
+        self.use_graph = bool(use_graph)
+        self.pool_mode = resolve_pool_mode(pool_mode=pool_mode, use_attention_readout=use_attention_readout)
 
         self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
-        self.graph = InterpersonalGraph(
-                                            dim=mlp_out_dim,
-                                            k_nn=2,
-                                            radius=2.5,
-                                            hidden=hidden_dim,
-                                            dropout=dropout,
-                                        )
+        self.graph = (
+            InterpersonalGraph(
+                                dim=mlp_out_dim,
+                                k_nn=2,
+                                radius=2.5,
+                                hidden=hidden_dim,
+                                dropout=dropout,
+                            )
+            if self.use_graph
+            else None
+        )
+        attn_hidden_dim = 32 if self.pool_mode == "attn" else mlp_out_dim
         self.pool = PersonPooling(
-                                mode=pool_mode,
+                                mode=self.pool_mode,
                                 emb_dim=mlp_out_dim,
-                                attn_hidden_dim=mlp_out_dim,
+                                attn_hidden_dim=attn_hidden_dim,
                                 dropout=dropout,
                             )
         pool_mult = {
@@ -103,8 +131,6 @@ class EventTCN(nn.Module):
                         "mean_max_std": 3,
                         "attn": 1,
                     }
-        if pool_mode not in pool_mult:
-            raise ValueError(f"Unsupported pool_mode: {pool_mode}")
 
         use_motion = self.tcn_input_mode == "pooled_count_motion"
         if self.tcn_input_mode not in {"pooled_count", "pooled_count_motion"}:
@@ -124,7 +150,7 @@ class EventTCN(nn.Module):
             self.motion_proj = None
             motion_out_dim = 0
 
-        in_ch = mlp_out_dim * pool_mult[pool_mode] + 1 + (motion_out_dim if use_motion else 0)
+        in_ch = mlp_out_dim * pool_mult[self.pool_mode] + 1 + (motion_out_dim if use_motion else 0)
 
         layers = []
         dilation = 1
@@ -155,7 +181,8 @@ class EventTCN(nn.Module):
             motion = x[..., -self.motion_dim:]
 
         emb, person_mask, person_bboxes = self.mlp(pose_x)      # (B,T,N,E), (B,T,N), (B,T,N,4)
-        emb = self.graph(emb, person_bboxes, person_mask)       # (B,T,N,E)
+        if self.graph is not None:
+            emb = self.graph(emb, person_bboxes, person_mask)   # (B,T,N,E)
         scene, _ = self.pool(emb, mask=person_mask, return_attn=True)
         count = person_mask.sum(dim=2).float()                  # (B,T)
         count_norm = count / person_mask.size(2)                # (B,T)

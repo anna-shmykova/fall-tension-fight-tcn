@@ -360,6 +360,8 @@ def main() -> None:
     model_cfg = cfg.get("model", {})
     tcn_input_mode = str(model_cfg.get("tcn_input_mode", "pooled_count"))
     motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
+    use_attention_readout = model_cfg.get("use_attention_readout", None)
+    use_graph = bool(model_cfg.get("use_graph", True))
 
     if tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
         raise ValueError("model.tcn_input_mode='pooled_count_motion' requires features.motion.enabled=true")
@@ -371,9 +373,11 @@ def main() -> None:
         kernel_size=int(model_cfg.get("kernel_size", 3)),
         mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
         pool_mode=str(model_cfg.get("pool_mode", "attn")),
+        use_attention_readout=use_attention_readout,
+        use_graph=use_graph,
         causal=bool(model_cfg.get("causal", True)),
         norm=str(model_cfg.get("norm", "group")),
-        #dropout=float(model_cfg.get("dropout", 0.1)),
+        dropout=float(model_cfg.get("dropout", 0.1)),
         motion_dim=motion_dim,
         motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
         tcn_input_mode=tcn_input_mode,

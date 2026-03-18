@@ -126,6 +126,8 @@ def main():
     model_cfg = ckpt_cfg.get("model", {})
     motion_cfg = motion_feature_cfg(feature_cfg)
     motion_dim = motion_feature_dim(feature_cfg)
+    use_attention_readout = model_cfg.get("use_attention_readout", None)
+    use_graph = bool(model_cfg.get("use_graph", True))
 
     C = args.K * 40 + 1 + motion_dim
     motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
@@ -136,6 +138,8 @@ def main():
         kernel_size=int(model_cfg.get("kernel_size", 3)),
         mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
         pool_mode=str(model_cfg.get("pool_mode", "attn")),
+        use_attention_readout=use_attention_readout,
+        use_graph=use_graph,
         causal=bool(model_cfg.get("causal", True)),
         norm=str(model_cfg.get("norm", "group")),
         dropout=float(model_cfg.get("dropout", 0.1)),
