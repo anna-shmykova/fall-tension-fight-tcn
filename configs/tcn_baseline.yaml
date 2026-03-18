@@ -16,12 +16,21 @@ features:
   # match what your current frame_to_vector does
   use_bbox: true
   use_keypoints: true
+  motion:
+    enabled: false
+    source: erez
+    align: prev
 
 labels:
   # match your current events_to_label
   task: binary
   window_policy: center
   drop_mixed_windows: true
+
+model:
+  pool_mode: attn
+  tcn_input_mode: pooled_count
+  motion_proj_dim: 32
 
 train:
   device: cpu

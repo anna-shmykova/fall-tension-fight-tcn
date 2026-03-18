@@ -11,12 +11,13 @@ class EventJsonDataset(Dataset):
         self.window_size = window_size
         self.window_step = window_step
         self.K = K
+        self.feature_cfg = feature_cfg or {}
         #self.img_w = img_w
         #self.img_h = img_h
 
         for path in json_paths:
             frame = read_json_frames(path)
-            X_seq, y_seq = build_sequence(frame, K)
+            X_seq, y_seq = build_sequence(frame, K, feature_cfg=self.feature_cfg)
             N = len(X_seq)
             if N < window_size:
                 continue

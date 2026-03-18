@@ -11,7 +11,12 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from src.data.features import frame_to_vector
+from src.data.features import (
+    extract_erez_motion_features,
+    frame_to_vector,
+    motion_feature_cfg,
+    motion_feature_dim,
+)
 from src.models.tcn import EventTCN
 
 
@@ -115,12 +120,31 @@ def main():
     yolo = YOLO(args.yolo_pose)
 
     # 2) Load TCN ONCE
-    # Input dim must match C=K*40+1 (1001 for K=25) :contentReference[oaicite:6]{index=6}
-    C = args.K * 40 + 1
-    model = EventTCN(input_dim=C, num_layers=4)  # uses BoneMLPEncoder+Pooling+TCN :contentReference[oaicite:7]{index=7}
-    sd = torch.load(args.ckpt, map_location="cpu")
-    if isinstance(sd, dict) and "model" in sd:
-        sd = sd["model"]
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+    feature_cfg = ckpt_cfg.get("features", {})
+    model_cfg = ckpt_cfg.get("model", {})
+    motion_cfg = motion_feature_cfg(feature_cfg)
+    motion_dim = motion_feature_dim(feature_cfg)
+
+    C = args.K * 40 + 1 + motion_dim
+    motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
+    model = EventTCN(
+        input_dim=C,
+        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+        num_layers=int(model_cfg.get("num_layers", 4)),
+        kernel_size=int(model_cfg.get("kernel_size", 3)),
+        mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+        pool_mode=str(model_cfg.get("pool_mode", "attn")),
+        causal=bool(model_cfg.get("causal", True)),
+        norm=str(model_cfg.get("norm", "group")),
+        dropout=float(model_cfg.get("dropout", 0.1)),
+        motion_dim=motion_dim,
+        motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
+        tcn_input_mode=str(model_cfg.get("tcn_input_mode", "pooled_count")),
+    )
+
+    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(sd, strict=True)
     model.to(device).eval()
 
@@ -144,6 +168,7 @@ def main():
     sampled_frame_ids: Deque[int] = deque(maxlen=args.win)
     next_infer_sample_idx = args.win - 1  # first time we can infer
     sample_idx = -1
+    prev_sample_frame: Optional[Dict[str, List[dict]]] = None
 
     last_p: Optional[float] = None
     last_state: bool = False
@@ -164,12 +189,25 @@ def main():
         if frame_idx % args.step == 0:
             sample_idx += 1
 
-            r = yolo(frame, conf=args.conf, verbose=False)[0]
+            r = yolo(frame, conf=args.conf, verbose=False, imgsz=(H,W))[0]
 
             frame, det_list = frame_to_detection_list(frame, W, H, r, conf_thresh=args.conf)
+            frame_payload = {"detection_list": det_list}
 
             # build vector exactly like training: frame_to_vector reads detection_list
-            x_t = frame_to_vector({"detection_list": det_list}, K=args.K, num_pers_features=40)  # (1001,)
+            x_t = frame_to_vector(frame_payload, K=args.K, num_pers_features=40, cfg=feature_cfg)
+            if motion_dim > 0:
+                if prev_sample_frame is None:
+                    motion_vec = np.zeros((motion_dim,), dtype=np.float32)
+                else:
+                    motion_vec = extract_erez_motion_features(
+                        [prev_sample_frame, frame_payload],
+                        align=motion_cfg.get("align", "prev"),
+                        j_version=feature_cfg.get("erez_json_version", 2.0),
+                    )[-1]
+                x_t = np.concatenate([x_t, motion_vec], axis=0).astype(np.float32)
+                prev_sample_frame = frame_payload
+
             vec_buf.append(x_t)
             sampled_frame_ids.append(frame_idx)
 

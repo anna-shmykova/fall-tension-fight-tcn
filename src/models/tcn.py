@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.models.encoders import BoneMLPEncoder
-from src.models.pooling import PersonPooling, AttentionReadout
+from src.models.pooling import PersonPooling
 from src.models.graph import InterpersonalGraph
 
 class CausalConv1d(nn.Module):
@@ -69,32 +69,33 @@ class EventTCN(nn.Module):
                     num_layers=3,
                     kernel_size=3,
                     mlp_out_dim=32,
-                    pool_mode="attn",
+                    pool_mode="mean_max_std",
                     causal=True,
                     norm="group",
+                    dropout=0.1,
+                    motion_dim=0,
+                    motion_proj_dim=None,
+                    tcn_input_mode="pooled_count",
                 ):
         super().__init__()
+        self.input_dim = int(input_dim)
+        self.motion_dim = int(motion_dim)
+        self.tcn_input_mode = str(tcn_input_mode)
+
         self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
         self.graph = InterpersonalGraph(
                                             dim=mlp_out_dim,
                                             k_nn=2,
                                             radius=2.5,
                                             hidden=hidden_dim,
-                                            dropout=0.1,
+                                            dropout=dropout,
                                         )
-        if not pool_mode == "attn":
-            self.pool = PersonPooling(
-                                    mode=pool_mode,
-                                    emb_dim=mlp_out_dim,
-                                    attn_hidden_dim=mlp_out_dim,
-                                    dropout=0.1,
-                                )
-        else: 
-            self.pool = AttentionReadout(
-                                        emb_dim=mlp_out_dim,
-                                        hidden_dim=32,
-                                        dropout=0.1
-                                      )
+        self.pool = PersonPooling(
+                                mode=pool_mode,
+                                emb_dim=mlp_out_dim,
+                                attn_hidden_dim=mlp_out_dim,
+                                dropout=dropout,
+                            )
         pool_mult = {
                         "mean": 1,
                         "max": 1,
@@ -102,7 +103,28 @@ class EventTCN(nn.Module):
                         "mean_max_std": 3,
                         "attn": 1,
                     }
-        in_ch = mlp_out_dim * pool_mult[pool_mode] + 1
+        if pool_mode not in pool_mult:
+            raise ValueError(f"Unsupported pool_mode: {pool_mode}")
+
+        use_motion = self.tcn_input_mode == "pooled_count_motion"
+        if self.tcn_input_mode not in {"pooled_count", "pooled_count_motion"}:
+            raise ValueError(f"Unsupported tcn_input_mode: {self.tcn_input_mode}")
+        if use_motion and self.motion_dim <= 0:
+            raise ValueError("tcn_input_mode='pooled_count_motion' requires motion_dim > 0")
+
+        if self.motion_dim > 0:
+            if motion_proj_dim is None:
+                self.motion_proj = nn.Identity()
+                motion_out_dim = self.motion_dim
+            else:
+                motion_proj_dim = int(motion_proj_dim)
+                self.motion_proj = nn.Linear(self.motion_dim, motion_proj_dim)
+                motion_out_dim = motion_proj_dim
+        else:
+            self.motion_proj = None
+            motion_out_dim = 0
+
+        in_ch = mlp_out_dim * pool_mult[pool_mode] + 1 + (motion_out_dim if use_motion else 0)
 
         layers = []
         dilation = 1
@@ -124,14 +146,27 @@ class EventTCN(nn.Module):
         self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
-        # x: (B, T, C)  (your BoneMLPEncoder already handles your format)
-        emb, person_mask, person_bboxes = self.mlp(x)          # (B,T,N,E), (B,T,N), (B,T,N,4)
-        emb = self.graph(emb, person_bboxes, person_mask)      # (B,T,N,E)
-        scene,_ = self.pool(emb, mask=person_mask)               # (B,T,E_scene)
-        #print(scene.shape)
-        count = person_mask.sum(dim=2).float()              # (B,T)
-        count_norm = count / person_mask.size(2)            # (B,T)
-        scene_count = torch.cat([scene, count_norm.unsqueeze(-1)], dim=-1)  # (B,T,E_scene+1)
+        motion = None
+        pose_x = x
+        if self.motion_dim > 0:
+            if x.size(-1) <= self.motion_dim:
+                raise ValueError("Input does not contain the expected static pose channels")
+            pose_x = x[..., :-self.motion_dim]
+            motion = x[..., -self.motion_dim:]
+
+        emb, person_mask, person_bboxes = self.mlp(pose_x)      # (B,T,N,E), (B,T,N), (B,T,N,4)
+        emb = self.graph(emb, person_bboxes, person_mask)       # (B,T,N,E)
+        scene, _ = self.pool(emb, mask=person_mask, return_attn=True)
+        count = person_mask.sum(dim=2).float()                  # (B,T)
+        count_norm = count / person_mask.size(2)                # (B,T)
+
+        tcn_inputs = [scene, count_norm.unsqueeze(-1)]
+        if self.tcn_input_mode == "pooled_count_motion":
+            if motion is None or self.motion_proj is None:
+                raise ValueError("Motion features are enabled in the model but missing at runtime")
+            tcn_inputs.append(self.motion_proj(motion))
+
+        scene_count = torch.cat(tcn_inputs, dim=-1)             # (B,T,E_scene+1[+motion])
 
         feat = self.tcn(scene_count.transpose(1, 2))        # (B, hidden, T)
         logits = self.head(feat)                            # (B,1,T)

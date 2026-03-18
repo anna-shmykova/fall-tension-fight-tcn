@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_last_aggr_graph_attent_readout_RWF_window_16_exclude_tens
+  name: tcn_causal_last_aggr_graph_pool_motion_erez_RWF_window_16_exclude_tens
   seed: 42
 
 paths:
@@ -19,7 +19,7 @@ data:
   kp_conf_keep: 0.3
 
   split:
-    mode: "generate"
+    mode: "fixed" #"generate"
     group_key: "video_id"
     seed: 42
     val_ratio: 0.2
@@ -31,6 +31,10 @@ features:
   use_keypoints: false
   use_quality_gates: true
   normalize: "bbox"   # "frame" or "bbox"
+  motion:
+    enabled: false
+    source: erez
+    align: prev       # prev avoids future leakage; next matches t->t+1 extraction
 
 model:
   type: "tcn"
@@ -42,7 +46,9 @@ model:
   kernel_size: 3
   dropout: 0.2
   mlp_out_dim: 32
-  pool_mode: mean_max_std
+  pool_mode: mean_max_std   # choices: mean, max, mean_max, mean_max_std, attn
+  tcn_input_mode: pooled_count   # choices: pooled_count, pooled_count_motion
+  motion_proj_dim: 32
 
 train:
   batch_size: 32

@@ -23,6 +23,7 @@ from src.data.splits import (
     write_split_files
     )
 from src.data.dataset import EventJsonDataset
+from src.data.features import motion_feature_dim
 from src.models.tcn import EventTCN
 from src.utils.metrics import (
     compute_auprc,
@@ -317,6 +318,7 @@ def main() -> None:
 
     feature_cfg = cfg.get("features", {})
     label_cfg = cfg.get("labels", {})
+    motion_dim = motion_feature_dim(feature_cfg)
 
     train_ds = EventJsonDataset(
         train_paths,
@@ -356,14 +358,25 @@ def main() -> None:
     print(f"[INFO] data_shape X, y: {X0.shape}, {y0.shape}")
 
     model_cfg = cfg.get("model", {})
+    tcn_input_mode = str(model_cfg.get("tcn_input_mode", "pooled_count"))
+    motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
+
+    if tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
+        raise ValueError("model.tcn_input_mode='pooled_count_motion' requires features.motion.enabled=true")
+
     model = EventTCN(
         input_dim=C,
         hidden_dim=int(model_cfg.get("hidden_dim", 64)),
         num_layers=int(model_cfg.get("num_layers", 4)),
-        #dilations=list(model_cfg.get("dilations", [1, 2, 4, 8])),
         kernel_size=int(model_cfg.get("kernel_size", 3)),
-        #dropout=float(model_cfg.get("dropout", 0.2)),
-        #causal=bool(model_cfg.get("causal", True)),
+        mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+        pool_mode=str(model_cfg.get("pool_mode", "attn")),
+        causal=bool(model_cfg.get("causal", True)),
+        norm=str(model_cfg.get("norm", "group")),
+        #dropout=float(model_cfg.get("dropout", 0.1)),
+        motion_dim=motion_dim,
+        motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
+        tcn_input_mode=tcn_input_mode,
     )
     
     device_str = cfg["train"].get("device", "cpu")
