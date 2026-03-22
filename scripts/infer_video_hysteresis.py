@@ -5,13 +5,14 @@ import argparse
 import json
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
+from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 from ultralytics import YOLO
 
 from src.data.features import (
@@ -25,6 +26,63 @@ from src.models.tcn import EventTCN, MotionTCN
 
 
 MOTION_ONLY_MODEL_TYPES = {"motion_tcn", "erez_motion_tcn"}
+TIME_TOKEN_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?\b")
+INT_TOKEN_RE = re.compile(r"\b\d+\b")
+
+
+@dataclass
+class GroundTruthSpec:
+    source_path: Optional[str] = None
+    source_kind: Optional[str] = None
+    positive_event_id: int = 4
+    gt_by_frame: Dict[int, int] = field(default_factory=dict)
+    gt_by_time_ms: Dict[int, int] = field(default_factory=dict)
+    intervals: List[dict] = field(default_factory=list)
+
+    def label_for(self, frame_idx: int, time_sec: float) -> Optional[int]:
+        if frame_idx in self.gt_by_frame:
+            return int(self.gt_by_frame[frame_idx])
+
+        time_ms = int(round(time_sec * 1000))
+        if time_ms in self.gt_by_time_ms:
+            return int(self.gt_by_time_ms[time_ms])
+
+        if self.source_kind == "txt":
+            for interval in self.intervals:
+                if interval["start_time_sec"] <= time_sec <= interval["end_time_sec"]:
+                    return int(interval["gt_label"])
+            return 0
+
+        return None
+
+    def positive_intervals(self, fps: float) -> List[dict]:
+        if self.source_kind == "txt":
+            src_intervals = [interval for interval in self.intervals if int(interval.get("gt_label", 0)) == 1]
+        else:
+            src_intervals = self.intervals
+
+        events = []
+        for interval in src_intervals:
+            start_time_sec = float(interval["start_time_sec"])
+            end_time_sec = float(interval["end_time_sec"])
+            start_frame = interval.get("start_frame")
+            end_frame = interval.get("end_frame")
+            if start_frame is None:
+                start_frame = int(round(start_time_sec * fps))
+            if end_frame is None:
+                end_frame = int(round(end_time_sec * fps))
+
+            item = {
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "start_time_sec": start_time_sec,
+                "end_time_sec": end_time_sec,
+            }
+            if interval.get("event_ids"):
+                item["event_ids"] = list(interval["event_ids"])
+            events.append(item)
+
+        return events
 
 
 @dataclass
@@ -55,11 +113,144 @@ class Hysteresis:
         return self.on
 
 
+def update_state(score: float, hyst: Hysteresis, disable_hysteresis: bool, threshold: float) -> bool:
+    if disable_hysteresis:
+        return bool(score >= threshold)
+    return hyst.update(score)
+
+
+def parse_timecode(value: str) -> float:
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes = int(parts[0])
+        seconds = float(parts[1])
+    elif len(parts) == 3:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    else:
+        raise ValueError(f"Unsupported timecode: {value!r}")
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def parse_gt_txt_intervals(gt_txt: str, positive_event_id: int) -> List[dict]:
+    path = Path(gt_txt).resolve()
+    intervals = []
+
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        matches = list(TIME_TOKEN_RE.finditer(line))
+        if len(matches) < 2:
+            raise ValueError(f"{path}:{line_no}: expected two timecodes in line: {raw_line!r}")
+
+        start_time_sec = parse_timecode(matches[0].group(0))
+        end_time_sec = parse_timecode(matches[1].group(0))
+        if end_time_sec < start_time_sec:
+            raise ValueError(f"{path}:{line_no}: end time is before start time: {raw_line!r}")
+
+        suffix = line[matches[1].end():]
+        suffix = re.sub(r"(?i)\bduration\b\s*[:=]?\s*\d+(?:[.,]\d+)?", " ", suffix, count=1)
+        event_ids = [int(tok.group(0)) for tok in INT_TOKEN_RE.finditer(suffix)]
+
+        intervals.append(
+            {
+                "start_time_sec": start_time_sec,
+                "end_time_sec": end_time_sec,
+                "event_ids": sorted(set(event_ids)),
+                "gt_label": int(int(positive_event_id) in event_ids),
+                "raw_line": raw_line.strip(),
+                "line_no": line_no,
+            }
+        )
+
+    return intervals
+
+
 def load_yaml(path: Path) -> dict:
     import yaml
 
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    return float(auc(recall, precision))
+
+
+def compute_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if np.unique(y_true).size < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, y_prob))
+
+
+def threshold_sweep_binary(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    start: float = 0.01,
+    end: float = 0.99,
+    step: float = 0.01,
+) -> List[Dict[str, float]]:
+    thresholds = np.arange(start, end + 1e-9, step)
+    results = []
+
+    for thr in thresholds:
+        y_pred = (y_prob >= thr).astype(np.int32)
+        tp = int(np.sum((y_pred == 1) & (y_true == 1)))
+        fp = int(np.sum((y_pred == 1) & (y_true == 0)))
+        fn = int(np.sum((y_pred == 0) & (y_true == 1)))
+
+        precision = tp / (tp + fp + 1e-12)
+        recall = tp / (tp + fn + 1e-12)
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+
+        results.append(
+            {
+                "threshold": float(thr),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+            }
+        )
+
+    return results
+
+
+def confusion_stats_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    y_pred = (y_prob >= threshold).astype(np.int32)
+    y_true_i = y_true.astype(np.int32)
+
+    tp = int(np.sum((y_pred == 1) & (y_true_i == 1)))
+    fp = int(np.sum((y_pred == 1) & (y_true_i == 0)))
+    tn = int(np.sum((y_pred == 0) & (y_true_i == 0)))
+    fn = int(np.sum((y_pred == 0) & (y_true_i == 1)))
+
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
+
+    return {
+        "threshold": float(threshold),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "accuracy": float(accuracy),
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    }
 
 
 def frame_to_detection_list(frame, W, H, results, conf_thresh: float) -> Tuple[np.ndarray, List[dict]]:
@@ -259,30 +450,38 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
     return model, model_type, feature_cfg
 
 
-def load_ground_truth(gt_json: Optional[str]):
-    if not gt_json:
-        return None, {}, {}
+def load_ground_truth(gt_json: Optional[str], gt_txt: Optional[str], positive_event_id: int) -> GroundTruthSpec:
+    if gt_json and gt_txt:
+        raise ValueError("Pass either --gt_json or --gt_txt, not both.")
 
-    path = Path(gt_json).resolve()
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    gt = GroundTruthSpec(positive_event_id=int(positive_event_id))
+    if gt_json:
+        path = Path(gt_json).resolve()
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    gt_by_frame = {}
-    gt_by_time_ms = {}
-    for idx, frame in enumerate(data.get("frames", [])):
-        frame_id = int(frame.get("f", idx))
-        time_ms = int(round(float(frame.get("t", 0.0)) * 1000))
-        label = int(events_to_label(frame))
-        gt_by_frame[frame_id] = label
-        gt_by_time_ms[time_ms] = label
+        gt.source_path = str(path)
+        gt.source_kind = "json"
 
-    return data, gt_by_frame, gt_by_time_ms
+        gt_records = []
+        for idx, frame in enumerate(data.get("frames", [])):
+            frame_id = int(frame.get("f", idx))
+            time_sec = float(frame.get("t", frame_id / 25.0))
+            time_ms = int(round(time_sec * 1000))
+            label = int(events_to_label(frame))
+            gt.gt_by_frame[frame_id] = label
+            gt.gt_by_time_ms[time_ms] = label
+            gt_records.append({"frame": frame_id, "time_sec": time_sec, "gt_label": label})
 
+        gt.intervals = build_intervals(gt_records, label_key="gt_label")
+        return gt
 
-def gt_label_for_frame(frame_idx: int, time_sec: float, gt_by_frame: dict, gt_by_time_ms: dict):
-    if frame_idx in gt_by_frame:
-        return gt_by_frame[frame_idx]
-    return gt_by_time_ms.get(int(round(time_sec * 1000)))
+    if gt_txt:
+        gt.source_path = str(Path(gt_txt).resolve())
+        gt.source_kind = "txt"
+        gt.intervals = parse_gt_txt_intervals(gt_txt, positive_event_id=positive_event_id)
+
+    return gt
 
 
 def build_intervals(records: List[dict], label_key: str) -> List[dict]:
@@ -357,14 +556,71 @@ def compute_binary_stats(records: List[dict]) -> dict:
     }
 
 
+def compute_probability_stats(records: List[dict], prob_key: str) -> dict:
+    eval_records = [record for record in records if record.get("gt_label") is not None and record.get(prob_key) is not None]
+    if not eval_records:
+        return {"n_eval_frames": 0}
+
+    y_true = np.asarray([int(record["gt_label"]) for record in eval_records], dtype=np.int32)
+    y_prob = np.asarray([float(record[prob_key]) for record in eval_records], dtype=np.float32)
+
+    pos_mask = y_true == 1
+    neg_mask = y_true == 0
+    sweep = threshold_sweep_binary(y_true, y_prob, start=0.01, end=0.99, step=0.01)
+    best = max(sweep, key=lambda row: row["f1"])
+
+    return {
+        "n_eval_frames": int(len(eval_records)),
+        "auprc": compute_auprc(y_true, y_prob),
+        "auroc": compute_auroc(y_true, y_prob),
+        "mean_prob_pos": float(np.mean(y_prob[pos_mask])) if np.any(pos_mask) else None,
+        "mean_prob_neg": float(np.mean(y_prob[neg_mask])) if np.any(neg_mask) else None,
+        "best_f1": {key: float(value) for key, value in best.items()},
+        "best_threshold_stats": confusion_stats_at_threshold(y_true, y_prob, threshold=float(best["threshold"])),
+        "fixed_thresholds": {
+            "0.3": confusion_stats_at_threshold(y_true, y_prob, threshold=0.3),
+            "0.5": confusion_stats_at_threshold(y_true, y_prob, threshold=0.5),
+            "0.7": confusion_stats_at_threshold(y_true, y_prob, threshold=0.7),
+        },
+        "threshold_sweep": sweep,
+    }
+
+
 def write_events_report(events_path: Path, predicted_events: List[dict], gt_events: List[dict], stats: dict) -> None:
+    def format_event_line(idx: int, event: dict) -> str:
+        line = f"{idx}. {event['start_time_sec']:.2f}s - {event['end_time_sec']:.2f}s"
+        if event.get("start_frame") is not None and event.get("end_frame") is not None:
+            line += f" (frames {int(event['start_frame'])}..{int(event['end_frame'])})"
+        if event.get("event_ids"):
+            line += f" events={','.join(str(event_id) for event_id in event['event_ids'])}"
+        return line
+
+    def append_stats_block(lines: List[str], title: str, summary: dict) -> None:
+        if not summary:
+            return
+        lines.append(title)
+        for key in ("n_eval_frames", "precision", "recall", "f1", "accuracy", "auprc", "auroc", "mean_prob_pos", "mean_prob_neg"):
+            if key not in summary:
+                continue
+            value = summary[key]
+            if isinstance(value, float):
+                lines.append(f"{key}: {value:.4f}")
+            else:
+                lines.append(f"{key}: {value}")
+
+        best = summary.get("best_threshold_stats")
+        if isinstance(best, dict):
+            lines.append(
+                "best_threshold: "
+                f"thr={best['threshold']:.2f} P={best['precision']:.3f} "
+                f"R={best['recall']:.3f} F1={best['f1']:.3f} "
+                f"ACC={best['accuracy']:.3f}"
+            )
+
     lines = ["Predicted events:"]
     if predicted_events:
         for idx, event in enumerate(predicted_events, start=1):
-            lines.append(
-                f"{idx}. {event['start_time_sec']:.2f}s - {event['end_time_sec']:.2f}s "
-                f"(frames {event['start_frame']}..{event['end_frame']})"
-            )
+            lines.append(format_event_line(idx, event))
     else:
         lines.append("none")
 
@@ -372,20 +628,18 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
     lines.append("Ground-truth events:")
     if gt_events:
         for idx, event in enumerate(gt_events, start=1):
-            lines.append(
-                f"{idx}. {event['start_time_sec']:.2f}s - {event['end_time_sec']:.2f}s "
-                f"(frames {event['start_frame']}..{event['end_frame']})"
-            )
+            lines.append(format_event_line(idx, event))
     else:
         lines.append("none")
 
     lines.append("")
     lines.append("Inference stats:")
-    for key, value in stats.items():
-        if isinstance(value, float):
-            lines.append(f"{key}: {value:.4f}")
-        else:
-            lines.append(f"{key}: {value}")
+    state_title = "Thresholded state:" if stats.get("state_method") == "threshold" else "Hysteresis:"
+    append_stats_block(lines, state_title, stats.get("hysteresis_stats", {}))
+    lines.append("")
+    append_stats_block(lines, "Raw probability:", stats.get("prob_raw_stats", {}))
+    lines.append("")
+    append_stats_block(lines, "Smoothed probability:", stats.get("prob_smooth_stats", {}))
 
     events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -404,6 +658,8 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--run_dir", default=None, help="Training run folder. If set, uses checkpoints/best.pt and config_resolved.yaml.")
     ap.add_argument("--gt_json", default=None, help="Optional annotated JSON for ground-truth comparison.")
+    ap.add_argument("--gt_txt", default=None, help="Optional text file with GT intervals. Supports 1.txt-style lines like '00:00:05, 00:00:15, 4'.")
+    ap.add_argument("--gt_positive_event_id", type=int, default=4, help="Event id from GT annotations to treat as the positive class.")
     ap.add_argument("--events_txt", default=None, help="Optional sidecar text file with predicted/GT events.")
     ap.add_argument("--stats_json", default=None, help="Optional sidecar JSON with inference-vs-GT statistics.")
 
@@ -420,7 +676,8 @@ def main():
     ap.add_argument("--k_on", type=int, default=3)
     ap.add_argument("--k_off", type=int, default=3)
     ap.add_argument("--N", type=int, default=6)
-    ap.add_argument("--ema_beta", type=float, default=0.85, help="EMA smoothing beta. 0 disables.")
+    ap.add_argument("--ema_beta", type=float, default=0, help="EMA smoothing beta. 0 disables.")
+    ap.add_argument("--disable_hysteresis", action="store_true", help="Threshold the score directly instead of applying hysteresis over time.")
 
     args = ap.parse_args()
 
@@ -431,8 +688,7 @@ def main():
     model, model_type, feature_cfg = load_model_from_payload(payload, cfg, args, device=device)
     motion_cfg = motion_feature_cfg(feature_cfg)
     motion_dim = motion_feature_dim(feature_cfg)
-
-    gt_data, gt_by_frame, gt_by_time_ms = load_ground_truth(args.gt_json)
+    gt = load_ground_truth(args.gt_json, args.gt_txt, positive_event_id=args.gt_positive_event_id)
 
     hyst = Hysteresis(HystCfg(args.thr_on, args.thr_off, args.k_on, args.k_off, args.N))
 
@@ -509,7 +765,12 @@ def main():
                         else:
                             p_smooth = ema_beta * p_smooth + (1.0 - ema_beta) * last_p
 
-                        last_state = hyst.update(p_smooth)
+                        last_state = update_state(
+                            score=float(p_smooth),
+                            hyst=hyst,
+                            disable_hysteresis=bool(args.disable_hysteresis),
+                            threshold=float(args.thr_on),
+                        )
                         did_infer = True
                         next_infer_idx += args.stride
 
@@ -542,12 +803,17 @@ def main():
                     else:
                         p_smooth = ema_beta * p_smooth + (1.0 - ema_beta) * last_p
 
-                    last_state = hyst.update(p_smooth)
+                    last_state = update_state(
+                        score=float(p_smooth),
+                        hyst=hyst,
+                        disable_hysteresis=bool(args.disable_hysteresis),
+                        threshold=float(args.thr_on),
+                    )
                     did_infer = True
                     next_infer_idx += args.stride
 
             if did_infer:
-                gt_label = gt_label_for_frame(frame_idx, sample_t, gt_by_frame, gt_by_time_ms)
+                gt_label = gt.label_for(frame_idx, sample_t)
                 records.append(
                     {
                         "frame": frame_idx,
@@ -559,15 +825,26 @@ def main():
                     }
                 )
 
+        frame_time_sec = frame_idx / fps
+        gt_now = gt.label_for(frame_idx, frame_time_sec)
         txt1 = f"p={last_p:.3f} ps={p_smooth:.3f}" if last_p is not None else "p=..."
         txt2 = "ABNORMAL=ON" if last_state else "ABNORMAL=OFF"
         txt3 = "infer" if did_infer else ""
         txt4 = f"model={model_type}"
+        if gt.source_kind:
+            txt5 = f"GT(event {gt.positive_event_id})={'ON' if gt_now == 1 else 'OFF' if gt_now == 0 else '?'}"
+            gt_color = (0, 0, 255) if gt_now == 1 else (255, 255, 255)
+        else:
+            txt5 = None
+            gt_color = (255, 255, 255)
 
         cv2.putText(frame, f"{txt2}  {txt1}  {txt3}", (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, f"{txt4}  frame={frame_idx} step={args.step} win={args.win} stride={args.stride}", (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        if txt5 is not None:
+            cv2.putText(frame, txt5, (20, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, gt_color, 2, cv2.LINE_AA)
 
         outv.write(frame)
 
@@ -575,22 +852,13 @@ def main():
     outv.release()
 
     predicted_events = build_intervals(records, label_key="pred_state")
+    gt_events = gt.positive_intervals(fps=fps)
 
-    gt_events = []
-    if gt_data is not None:
-        gt_records = []
-        for idx, frame in enumerate(gt_data.get("frames", [])):
-            frame_id = int(frame.get("f", idx))
-            gt_records.append(
-                {
-                    "frame": frame_id,
-                    "time_sec": float(frame.get("t", frame_id / fps)),
-                    "gt_label": int(events_to_label(frame)),
-                }
-            )
-        gt_events = build_intervals(gt_records, label_key="gt_label")
+    hyst_stats = compute_binary_stats(records)
+    prob_raw_stats = compute_probability_stats(records, prob_key="prob")
+    prob_smooth_stats = compute_probability_stats(records, prob_key="prob_smooth")
 
-    stats = compute_binary_stats(records)
+    stats = dict(hyst_stats)
     stats.update(
         {
             "model_type": model_type,
@@ -599,7 +867,18 @@ def main():
             "checkpoint": str(ckpt_path),
             "run_dir": str(Path(args.run_dir).resolve()) if args.run_dir else None,
             "gt_json": str(Path(args.gt_json).resolve()) if args.gt_json else None,
+            "gt_txt": str(Path(args.gt_txt).resolve()) if args.gt_txt else None,
+            "gt_source_kind": gt.source_kind,
+            "gt_positive_event_id": int(gt.positive_event_id),
+            "hysteresis_enabled": bool(not args.disable_hysteresis),
+            "state_method": "threshold" if args.disable_hysteresis else "hysteresis",
+            "state_threshold": float(args.thr_on),
             "n_predictions": len(records),
+            "n_predicted_events": len(predicted_events),
+            "n_gt_events": len(gt_events),
+            "hysteresis_stats": hyst_stats,
+            "prob_raw_stats": prob_raw_stats,
+            "prob_smooth_stats": prob_smooth_stats,
         }
     )
 

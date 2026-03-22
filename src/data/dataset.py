@@ -5,14 +5,26 @@ from torch.utils.data import Dataset
 import numpy as np
 import torch
 
+
+def resolve_target_index(window_size: int, target_mode: str) -> int:
+    target_mode = str(target_mode).lower()
+    if target_mode == "center":
+        return window_size // 2
+    if target_mode == "last":
+        return window_size - 1
+    raise ValueError(f"Unsupported target_mode: {target_mode}")
+
+
 class _BaseWindowDataset(Dataset):
     def __init__(self, json_paths, K, sequence_builder,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
         self.samples = []
         self.window_size = window_size
         self.window_step = window_step
         self.K = K
         self.feature_cfg = feature_cfg or {}
+        self.target_mode = str(target_mode).lower()
+        self.target_index = resolve_target_index(window_size=self.window_size, target_mode=self.target_mode)
 
         for path in json_paths:
             frame = read_json_frames(path)
@@ -25,23 +37,17 @@ class _BaseWindowDataset(Dataset):
                 end = start + window_size
                 X_win = X_seq[start:end] # (T, C)
                 y_win = y_seq[start:end]    # (T,)
-                #ignore examples of dataset where events are at the very beginning and at the very end
-                count_pos_beg = np.sum(y_win[:window_size//2] == 1)
-                count_pos_end = np.sum(y_win[window_size//2:] == 1)
-                if y_win[window_size//2] == 1 or (y_win[window_size//2] == 0 and (count_pos_beg == 0 and count_pos_end == 0)):
-                    y_central = y_win[window_size//2]
-                    #print(y_central)
-                
-                    # if window has only 'none', keep only a fraction
-                    #if np.all(y_win == 0):
-                        #if np.random.rand() > 0.2:  # keep ~20% of pure-none windows
-                            #continue
-    
-                    self.samples.append((X_win, y_central))
+                y_target = y_win[self.target_index]
+                has_any_pos = bool(np.any(y_win == 1))
+
+                # Keep windows whose target frame is positive, or windows that are entirely negative.
+                # Drop mixed windows where the event is elsewhere in the window but not at the target frame.
+                if y_target == 1 or not has_any_pos:
+                    self.samples.append((X_win, y_target))
                 else:
                     continue
                 
-        print("Total windows:", len(self.samples))
+        print(f"Total windows ({self.target_mode} target):", len(self.samples))
 
     def __len__(self):
         return len(self.samples)
@@ -55,7 +61,7 @@ class _BaseWindowDataset(Dataset):
 
 class EventJsonDataset(_BaseWindowDataset):
     def __init__(self, json_paths, K,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
         super().__init__(
             json_paths=json_paths,
             K=K,
@@ -65,12 +71,13 @@ class EventJsonDataset(_BaseWindowDataset):
             feature_cfg=feature_cfg,
             label_cfg=label_cfg,
             window_cfg=window_cfg,
+            target_mode=target_mode,
         )
 
 
 class MotionJsonDataset(_BaseWindowDataset):
     def __init__(self, json_paths, K,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
         super().__init__(
             json_paths=json_paths,
             K=K,
@@ -80,4 +87,5 @@ class MotionJsonDataset(_BaseWindowDataset):
             feature_cfg=feature_cfg,
             label_cfg=label_cfg,
             window_cfg=window_cfg,
+            target_mode=target_mode,
         )

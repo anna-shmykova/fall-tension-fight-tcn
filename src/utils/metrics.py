@@ -3,7 +3,7 @@ import csv
 from pathlib import Path
 from typing import List, Dict, Any
 import matplotlib.pyplot as plt
-from sklearn.metrics import precision_recall_curve, auc
+from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
 
 
 # ---------------------------------------------------------
@@ -24,6 +24,14 @@ def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     """
     precision, recall, _ = precision_recall_curve(y_true, y_prob)
     return auc(recall, precision)
+
+
+def compute_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if np.unique(y_true).size < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, y_prob))
 
 
 # ---------------------------------------------------------
@@ -146,6 +154,7 @@ def save_learning_curves(out_dir: Path, history: List[Dict[str, Any]]) -> None:
     epoch_list = [h["epoch"] for h in history]
     train_loss_list = [h["train_loss"] for h in history]
     val_auprc_list = [h["val_auprc"] for h in history]
+    val_auroc_list = [h.get("val_auroc", float("nan")) for h in history]
     lr_list = [h["lr"] for h in history]
 
     plt.figure()
@@ -165,6 +174,16 @@ def save_learning_curves(out_dir: Path, history: List[Dict[str, Any]]) -> None:
     plt.grid(True)
     plt.savefig(out_dir / "val_auprc.png", dpi=150)
     plt.close()
+
+    if any("val_auroc" in h for h in history):
+        plt.figure()
+        plt.plot(epoch_list, val_auroc_list)
+        plt.xlabel("Epoch")
+        plt.ylabel("Val AUROC")
+        plt.title("Validation AUROC")
+        plt.grid(True)
+        plt.savefig(out_dir / "val_auroc.png", dpi=150)
+        plt.close()
 
     plt.figure()
     plt.plot(epoch_list, lr_list)

@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_last_aggr_graph_pool_motion_erez_RWF_window_16_exclude_tens
+  name: tcn_causal_last_aggr_mlp_pool_motion_erez_RWF_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:
@@ -8,6 +8,7 @@ paths:
 
 data:
   label_mode: "binary_tension"   # or multi-class later
+  target_mode: last # central
   window_size: 16
   window_step: 4
   fps: 25
@@ -38,7 +39,7 @@ features:
 
 model:
   type: "tcn"
-  use_graph: true
+  use_graph: false
   use_attention_readout: false   # true forces attn; false uses pool_mode below
   causal: true
   norm: group   # group recommended for strict causality during training
@@ -57,15 +58,16 @@ train:
   epochs: 15
   lr: 0.0005
   weight_decay: 0.0001
-  pos_weight: 4.0
+  pos_weight: 1.0
   grad_clip: 1.0
   early_stop_patience: 7
   num_workers: 0
   device: cuda
-  agg_mode: last #logsumexp          # or logmeanexp (recommended)
+  agg_mode: last #logsumexp          # or logmeanexp (recommended) last
   logsumexp_temperature: 1.0
-  end_loss_alpha: 0.5          # 0.0 disables
+  end_loss_alpha: 0.5 #0.5          # 0.0 disables
   end_loss_k: 4                # last 4 steps = 0.8s at 5Hz
+  save_all_checkpoints: true
   
 eval:
   threshold_sweep:

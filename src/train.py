@@ -26,6 +26,7 @@ from src.data.dataset import EventJsonDataset, MotionJsonDataset
 from src.data.features import motion_feature_dim
 from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
+    compute_auroc,
     compute_auprc,
     threshold_sweep_binary,
     confusion_stats_at_threshold,
@@ -150,6 +151,7 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device, 
 
     probs = 1 / (1 + np.exp(-logits))
     auprc = compute_auprc(targets, probs)
+    auroc = compute_auroc(targets, probs)
 
     pos_mask = targets == 1
     neg_mask = targets == 0
@@ -167,6 +169,7 @@ def evaluate_binary(model: nn.Module, loader: DataLoader, device: torch.device, 
 
     return {
         "auprc": float(auprc),
+        "auroc": float(auroc),
         "best_f1": {k: float(v) for k, v in best.items()},
         "best_threshold_stats": best_threshold_stats,
         "mean_prob_pos": mean_prob_pos,
@@ -238,6 +241,18 @@ def main() -> None:
 
     cfg_path = Path(args.config).resolve()
     cfg = load_yaml(cfg_path)
+    preview_data_cfg = cfg.get("data", {})
+    preview_model_cfg = cfg.get("model", {})
+    preview_train_cfg = cfg.get("train", {})
+    target_mode = str(
+        preview_data_cfg.get(
+            "target_mode",
+            "last" if bool(preview_model_cfg.get("causal", True)) else "center",
+        )
+    ).lower()
+    save_all_checkpoints = bool(preview_train_cfg.get("save_all_checkpoints", True))
+    if target_mode not in {"center", "last"}:
+        raise ValueError(f"Unsupported data.target_mode: {target_mode}")
 
     # Resolve base roots
     root = project_root()
@@ -268,6 +283,10 @@ def main() -> None:
     cfg_resolved["paths"] = dict(cfg_resolved.get("paths", {}))
     cfg_resolved["paths"]["data_root"] = str(data_root)
     cfg_resolved["paths"]["runs_root"] = str(runs_root)
+    cfg_resolved["data"] = dict(cfg_resolved.get("data", {}))
+    cfg_resolved["data"]["target_mode"] = target_mode
+    cfg_resolved["train"] = dict(cfg_resolved.get("train", {}))
+    cfg_resolved["train"]["save_all_checkpoints"] = save_all_checkpoints
     cfg_resolved["run_dir"] = str(run_dir)
 
     save_yaml(cfg_resolved, run_dir / "config_resolved.yaml")
@@ -330,6 +349,7 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        target_mode=target_mode,
     )
     val_ds = dataset_cls(
         val_paths,
@@ -338,6 +358,7 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        target_mode=target_mode,
     )
 
     # Quick sanity prints
@@ -426,6 +447,13 @@ def main() -> None:
     temperature = cfg["train"].get("logsumexp_temperature", 1.0)
     end_loss_alpha = cfg["train"].get("end_loss_alpha", 0.5)
     end_loss_k = cfg["train"].get("end_loss_k", 4)
+
+    print(f"[INFO] target_mode: {target_mode}")
+    if bool(model_cfg.get("causal", True)) and target_mode != "last":
+        print("[WARN] model.causal=true but data.target_mode is not 'last'.")
+    if target_mode == "last" and str(agg_mode).lower() != "last":
+        print("[WARN] data.target_mode='last' but train.agg_mode is not 'last'; validation remains window-level.")
+    print(f"[INFO] save_all_checkpoints: {save_all_checkpoints}")
     
     # 10) Train
     best_auprc = -1.0
@@ -441,6 +469,7 @@ def main() -> None:
 
         val_out = evaluate_binary(model, val_loader, device=device, agg_mode=agg_mode, temperature=temperature)
         val_auprc = val_out["auprc"]
+        val_auroc = val_out["auroc"]
 
         # Step scheduler (ReduceLROnPlateau expects metric)
         scheduler.step(val_auprc)
@@ -453,6 +482,7 @@ def main() -> None:
         fixed07 = val_out["fixed_thresholds"]["0.7"]
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_auprc={val_auprc:.4f} "
+            f"| val_auroc={val_auroc:.4f} "
             f"| bestF1={val_out['best_f1']} | mean_p(pos)={val_out['mean_prob_pos']:.3f} "
             f"| mean_p(neg)={val_out['mean_prob_neg']:.3f} | thr0.5 F1={fixed05['f1']:.3f} "
             f"(P={fixed05['precision']:.3f}, R={fixed05['recall']:.3f}) | lr={lr:.2e}"
@@ -462,6 +492,7 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_loss,
             "val_auprc": val_auprc,
+            "val_auroc": val_auroc,
             "best_f1": val_out["best_f1"],
             "mean_prob_pos": float(val_out["mean_prob_pos"]),
             "mean_prob_neg": float(val_out["mean_prob_neg"]),
@@ -479,24 +510,31 @@ def main() -> None:
 
         # Save metrics.csv every epoch (safer than only on "best")
         save_history_csv(reports_dir, history)
+
+        ckpt_payload = {
+            "model": model.state_dict(),
+            "cfg": cfg_resolved,
+            "epoch": epoch,
+            "val_auprc": float(val_auprc),
+            "val_auroc": float(val_auroc),
+            "best_auprc": float(max(best_auprc, val_auprc)),
+            "optimizer": optim.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }
+
+        latest_ckpt_path = checkpoints_dir / "latest.pt"
+        torch.save(ckpt_payload, latest_ckpt_path)
+
+        if save_all_checkpoints:
+            epoch_ckpt_path = checkpoints_dir / f"epoch_{epoch:03d}.pt"
+            torch.save(ckpt_payload, epoch_ckpt_path)
         
         # Save best checkpoint + best-epoch artifacts
         if val_auprc > best_auprc:
             best_auprc = val_auprc
             ckpt_path = checkpoints_dir / "best.pt"
-            #torch.save({"model": model.state_dict(), "cfg": cfg_resolved}, ckpt_path)
-
-            torch.save(
-            {
-                "model": model.state_dict(),
-                "cfg": cfg_resolved,
-                "epoch": epoch,
-                "best_auprc": best_auprc,
-                "optimizer": optim.state_dict(),
-                "scheduler": scheduler.state_dict(),
-            },
-            ckpt_path
-            )            
+            ckpt_payload["best_auprc"] = float(best_auprc)
+            torch.save(ckpt_payload, ckpt_path)
             # Save full metrics for best epoch
             ( metrics_dir / "metrics.json").write_text(
                 json.dumps(
@@ -506,6 +544,7 @@ def main() -> None:
                         "history": history,
                         "val_details": {
                             "auprc": val_out["auprc"],
+                            "auroc": val_out["auroc"],
                             "best_f1": val_out["best_f1"],
                             "best_threshold_stats": val_out["best_threshold_stats"],
                             "mean_prob_pos": val_out["mean_prob_pos"],
