@@ -2,10 +2,8 @@
 from __future__ import annotations
 import argparse
 import json
-import os
 import random
 import subprocess
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -19,22 +17,29 @@ from torch.utils.data import DataLoader
 # Expect these modules to exist after your refactor:
 from src.data.path_utils import collect_json_paths
 from src.data.splits import (
+    read_paths_txt,
     split_paths,
-    write_split_files
-    )
+    write_paths_txt,
+    write_split_files,
+)
 from src.data.dataset import EventJsonDataset, MotionJsonDataset
 from src.data.features import motion_feature_dim
 from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
     compute_auroc,
     compute_auprc,
+    compute_pr_points,
+    compute_roc_points,
     threshold_sweep_binary,
     confusion_stats_at_threshold,
     save_history_csv,
+    save_rows_csv,
+    save_summary_csv,
     save_threshold_sweep_csv,
     save_learning_curves,
     save_confusion_matrix_image,
     save_pr_curve_image,
+    save_roc_curve_image,
 )
 
 #from sklearn.metrics import average_precision_score, precision_recall_curve
@@ -127,6 +132,142 @@ def threshold_for_precision(sweep, target_precision=0.5):
     if not candidates:
         return None
     return max(candidates, key=lambda r: r["recall"])
+
+
+def normalize_paths(paths: List[Path | str]) -> List[str]:
+    return [str(Path(p).resolve()) for p in paths]
+
+
+def require_existing_paths(paths: List[str], label: str) -> None:
+    missing = [p for p in paths if not Path(p).exists()]
+    if missing:
+        preview = "\n".join(missing[:5])
+        raise FileNotFoundError(f"Missing {label} paths ({len(missing)} total). First entries:\n{preview}")
+
+
+def assert_disjoint(a_name: str, a_paths: List[str], b_name: str, b_paths: List[str]) -> None:
+    overlap = sorted(set(a_paths) & set(b_paths))
+    if overlap:
+        preview = "\n".join(overlap[:5])
+        raise ValueError(f"{a_name} and {b_name} overlap ({len(overlap)} files). First entries:\n{preview}")
+
+
+def build_dataset(
+    dataset_cls,
+    paths: List[str],
+    *,
+    K: int,
+    window_size: int,
+    window_step: int,
+    feature_cfg: Dict[str, Any],
+    label_cfg: Dict[str, Any],
+    target_mode: str,
+):
+    return dataset_cls(
+        paths,
+        K=K,
+        window_size=window_size,
+        window_step=window_step,
+        feature_cfg=feature_cfg,
+        label_cfg=label_cfg,
+        target_mode=target_mode,
+    )
+
+
+def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+
+
+def safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
+def fpr_from_stats(stats: Dict[str, float]) -> float:
+    denom = float(stats["fp"] + stats["tn"])
+    return float(stats["fp"] / denom) if denom > 0 else float("nan")
+
+
+def evaluate_single_path(
+    model: nn.Module,
+    dataset_cls,
+    json_path: str,
+    *,
+    K: int,
+    window_size: int,
+    window_step: int,
+    feature_cfg: Dict[str, Any],
+    label_cfg: Dict[str, Any],
+    target_mode: str,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    agg_mode: str,
+    temperature: float,
+    selected_threshold: float,
+) -> Dict[str, Any]:
+    ds = build_dataset(
+        dataset_cls,
+        [json_path],
+        K=K,
+        window_size=window_size,
+        window_step=window_step,
+        feature_cfg=feature_cfg,
+        label_cfg=label_cfg,
+        target_mode=target_mode,
+    )
+    row: Dict[str, Any] = {
+        "json_path": json_path,
+        "json_name": Path(json_path).name,
+        "n_windows": int(len(ds)),
+    }
+    if len(ds) == 0:
+        row.update(
+            {
+                "n_pos": 0,
+                "n_neg": 0,
+                "auprc": float("nan"),
+                "auroc": float("nan"),
+                "val_threshold": selected_threshold,
+                "val_thr_precision": float("nan"),
+                "val_thr_recall": float("nan"),
+                "val_thr_f1": float("nan"),
+                "val_thr_accuracy": float("nan"),
+                "val_thr_fpr": float("nan"),
+                "oracle_threshold": float("nan"),
+                "oracle_f1": float("nan"),
+                "mean_prob_pos": float("nan"),
+                "mean_prob_neg": float("nan"),
+            }
+        )
+        return row
+
+    loader = make_loader(ds, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+    out = evaluate_binary(model, loader, device=device, agg_mode=agg_mode, temperature=temperature)
+    targets = np.asarray(out["targets"], dtype=np.int32)
+    probs = np.asarray(out["probs"], dtype=np.float32)
+    selected_stats = confusion_stats_at_threshold(targets, probs, threshold=selected_threshold)
+    row.update(
+        {
+            "n_pos": int(np.sum(targets == 1)),
+            "n_neg": int(np.sum(targets == 0)),
+            "auprc": safe_float(out["auprc"]),
+            "auroc": safe_float(out["auroc"]),
+            "val_threshold": selected_threshold,
+            "val_thr_precision": safe_float(selected_stats["precision"]),
+            "val_thr_recall": safe_float(selected_stats["recall"]),
+            "val_thr_f1": safe_float(selected_stats["f1"]),
+            "val_thr_accuracy": safe_float(selected_stats["accuracy"]),
+            "val_thr_fpr": fpr_from_stats(selected_stats),
+            "oracle_threshold": safe_float(out["best_f1"]["threshold"]),
+            "oracle_f1": safe_float(out["best_f1"]["f1"]),
+            "mean_prob_pos": safe_float(out["mean_prob_pos"]),
+            "mean_prob_neg": safe_float(out["mean_prob_neg"]),
+        }
+    )
+    return row
 
 # ----------------------------
 # Training / Eval loops
@@ -294,34 +435,76 @@ def main() -> None:
 
     # 4) Collect json paths
     # Expect jsons under data_root (possibly nested).
-    all_jsons = collect_json_paths(data_root)
+    all_jsons = normalize_paths(collect_json_paths(data_root))
     if len(all_jsons) == 0:
         raise RuntimeError(f"No jsons found under {data_root}")
 
     # 5) Make or load split
     split_cfg = cfg.get("data", {}).get("split", {"mode": "generate"})
-    split_mode = split_cfg.get("mode", "generate")
+    split_mode = str(split_cfg.get("mode", "generate")).lower()
+    split_seed = int(split_cfg.get("seed", seed))
+    test_paths: List[str] = []
 
     if split_mode == "fixed":
         train_list = resolve_path(split_cfg["train_list"], root)
         val_list = resolve_path(split_cfg["val_list"], root)
-        #train_paths = read_paths_txt(train_list, base=data_root)
-        #val_paths = read_paths_txt(val_list, base=data_root)
-        with open(train_list, 'r') as f:
-            lines = f.readlines()
-            train_paths = [line.rstrip('\n') for line in lines]
+        train_paths = normalize_paths(read_paths_txt(train_list, base_dirs=[data_root, root]))
+        val_paths = normalize_paths(read_paths_txt(val_list, base_dirs=[data_root, root]))
+        test_list_value = split_cfg.get("test_list", None)
+        if test_list_value:
+            test_list = resolve_path(test_list_value, root)
+            test_paths = normalize_paths(read_paths_txt(test_list, base_dirs=[data_root, root]))
 
-        with open(val_list, 'r') as f:
-            lines = f.readlines()
-            val_paths = [line.rstrip('\n') for line in lines]
-            
+        require_existing_paths(train_paths, "train")
+        require_existing_paths(val_paths, "val")
+        if test_paths:
+            require_existing_paths(test_paths, "test")
+
+        assert_disjoint("train", train_paths, "val", val_paths)
+        if test_paths:
+            assert_disjoint("train", train_paths, "test", test_paths)
+            assert_disjoint("val", val_paths, "test", test_paths)
+
+        write_split_files(
+            train_paths,
+            val_paths,
+            out_dir=splits_dir,
+            train_name="train_paths.txt",
+            val_name="val_paths.txt",
+        )
+        if test_paths:
+            write_paths_txt(test_paths, splits_dir / "test_paths.txt")
+    elif split_mode == "train_test_lists":
+        train_list = resolve_path(split_cfg["train_list"], root)
+        test_list = resolve_path(split_cfg["test_list"], root)
+        train_pool_paths = normalize_paths(read_paths_txt(train_list, base_dirs=[data_root, root]))
+        test_paths = normalize_paths(read_paths_txt(test_list, base_dirs=[data_root, root]))
+        require_existing_paths(train_pool_paths, "train_pool")
+        require_existing_paths(test_paths, "test")
+        assert_disjoint("train_pool", train_pool_paths, "test", test_paths)
+
+        val_ratio = float(split_cfg.get("val_ratio", 0.2))
+        train_paths, val_paths = split_paths(train_pool_paths, val_size=val_ratio, seed=split_seed)
+        train_paths = normalize_paths(train_paths)
+        val_paths = normalize_paths(val_paths)
+        assert_disjoint("train", train_paths, "val", val_paths)
+
+        write_split_files(
+            train_paths,
+            val_paths,
+            out_dir=splits_dir,
+            train_name="train_paths.txt",
+            val_name="val_paths.txt",
+        )
+        write_paths_txt(test_paths, splits_dir / "test_paths.txt")
     else:
         # generate per run
         val_ratio = float(split_cfg.get("val_ratio", 0.2))
-        split_seed = int(split_cfg.get("seed", seed))
         train_paths, val_paths = split_paths(
             all_jsons, val_size=val_ratio, seed=split_seed
         )
+        train_paths = normalize_paths(train_paths)
+        val_paths = normalize_paths(val_paths)
         write_split_files(
             train_paths, val_paths,
             out_dir=splits_dir,
@@ -342,7 +525,8 @@ def main() -> None:
     motion_dim = motion_feature_dim(feature_cfg)
     dataset_cls = MotionJsonDataset if model_type in {"motion_tcn", "erez_motion_tcn"} else EventJsonDataset
 
-    train_ds = dataset_cls(
+    train_ds = build_dataset(
+        dataset_cls,
         train_paths,
         K=K,
         window_size=window_size,
@@ -351,7 +535,8 @@ def main() -> None:
         label_cfg=label_cfg,
         target_mode=target_mode,
     )
-    val_ds = dataset_cls(
+    val_ds = build_dataset(
+        dataset_cls,
         val_paths,
         K=K,
         window_size=window_size,
@@ -360,18 +545,40 @@ def main() -> None:
         label_cfg=label_cfg,
         target_mode=target_mode,
     )
+    test_ds = None
+    if test_paths:
+        test_ds = build_dataset(
+            dataset_cls,
+            test_paths,
+            K=K,
+            window_size=window_size,
+            window_step=window_step,
+            feature_cfg=feature_cfg,
+            label_cfg=label_cfg,
+            target_mode=target_mode,
+        )
 
     # Quick sanity prints
     print(f"[INFO] data_root: {data_root}")
     print(f"[INFO] run_dir:   {run_dir}")
-    print(f"[INFO] jsons:     {len(all_jsons)} total | {len(train_paths)} train_jsons | {len(val_paths)} val_jsons")
-    print(f"[INFO] windows:   {len(train_ds)} train_windows | {len(val_ds)} val_windows")
+    json_counts = f"{len(all_jsons)} total | {len(train_paths)} train_jsons | {len(val_paths)} val_jsons"
+    window_counts = f"{len(train_ds)} train_windows | {len(val_ds)} val_windows"
+    if test_ds is not None:
+        json_counts += f" | {len(test_paths)} test_jsons"
+        window_counts += f" | {len(test_ds)} test_windows"
+    print(f"[INFO] split_mode: {split_mode}")
+    print(f"[INFO] jsons:     {json_counts}")
+    print(f"[INFO] windows:   {window_counts}")
+    if len(train_ds) == 0:
+        raise RuntimeError("Train dataset has 0 windows after filtering.")
+    if len(val_ds) == 0:
+        raise RuntimeError("Validation dataset has 0 windows after filtering.")
 
     # 7) Dataloaders
     bs = int(cfg["train"].get("batch_size", 64))
     num_workers = int(cfg["train"].get("num_workers", 2))
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_loader = make_loader(train_ds, batch_size=bs, num_workers=num_workers, shuffle=True)
+    val_loader = make_loader(val_ds, batch_size=bs, num_workers=num_workers, shuffle=False)
 
     # 8) Model
     # You must know input dim C. Best is to infer from one sample:
@@ -457,6 +664,8 @@ def main() -> None:
     
     # 10) Train
     best_auprc = -1.0
+    best_epoch = 0
+    best_val_threshold = None
     history = []
 
     for epoch in range(1, epochs + 1):
@@ -532,6 +741,8 @@ def main() -> None:
         # Save best checkpoint + best-epoch artifacts
         if val_auprc > best_auprc:
             best_auprc = val_auprc
+            best_epoch = epoch
+            best_val_threshold = float(val_out["best_f1"]["threshold"])
             ckpt_path = checkpoints_dir / "best.pt"
             ckpt_payload["best_auprc"] = float(best_auprc)
             torch.save(ckpt_payload, ckpt_path)
@@ -584,6 +795,170 @@ def main() -> None:
     
             # Plots for best checkpoint moment (optional)
             save_learning_curves(reports_dir, history)
+
+    if test_ds is not None:
+        final_test_dir = run_dir / "final_test"
+        final_test_dir.mkdir(parents=True, exist_ok=True)
+
+        if len(test_ds) == 0:
+            print("[WARN] Test dataset has 0 windows after filtering. Skipping final test evaluation.")
+        else:
+            best_ckpt = torch.load(checkpoints_dir / "best.pt", map_location=device)
+            model.load_state_dict(best_ckpt["model"])
+            model.to(device)
+
+            test_loader = make_loader(test_ds, batch_size=bs, num_workers=num_workers, shuffle=False)
+            test_out = evaluate_binary(model, test_loader, device=device, agg_mode=agg_mode, temperature=temperature)
+            test_targets = np.asarray(test_out["targets"], dtype=np.int32)
+            test_probs = np.asarray(test_out["probs"], dtype=np.float32)
+            selected_threshold = float(best_val_threshold if best_val_threshold is not None else test_out["best_f1"]["threshold"])
+            selected_stats = confusion_stats_at_threshold(test_targets, test_probs, threshold=selected_threshold)
+            oracle_stats = test_out["best_threshold_stats"]
+            roc_rows = compute_roc_points(test_targets, test_probs)
+            pr_rows = compute_pr_points(test_targets, test_probs)
+
+            per_file_rows: List[Dict[str, Any]] = []
+            print(f"[INFO] Evaluating {len(test_paths)} held-out test files for per-file report")
+            for json_path in test_paths:
+                per_file_rows.append(
+                    evaluate_single_path(
+                        model,
+                        dataset_cls,
+                        json_path,
+                        K=K,
+                        window_size=window_size,
+                        window_step=window_step,
+                        feature_cfg=feature_cfg,
+                        label_cfg=label_cfg,
+                        target_mode=target_mode,
+                        batch_size=bs,
+                        num_workers=num_workers,
+                        device=device,
+                        agg_mode=agg_mode,
+                        temperature=temperature,
+                        selected_threshold=selected_threshold,
+                    )
+                )
+
+            n_pos = int(np.sum(test_targets == 1))
+            n_neg = int(np.sum(test_targets == 0))
+            selected_fpr = fpr_from_stats(selected_stats)
+            oracle_fpr = fpr_from_stats(oracle_stats)
+
+            save_threshold_sweep_csv(final_test_dir, test_out["sweep"])
+            save_rows_csv(final_test_dir / "per_file.csv", per_file_rows)
+            if roc_rows:
+                save_rows_csv(final_test_dir / "roc.csv", roc_rows)
+            if pr_rows:
+                save_rows_csv(final_test_dir / "pr.csv", pr_rows)
+
+            save_confusion_matrix_image(
+                final_test_dir / "cm_norm_thr_val_selected.png",
+                selected_stats,
+                title=f"Final Test Confusion Matrix (normalized) @ val thr={selected_threshold:.2f}",
+            )
+            save_confusion_matrix_image(
+                final_test_dir / "cm_norm_thr_test_best_f1.png",
+                oracle_stats,
+                title=f"Final Test Confusion Matrix (normalized) @ oracle thr={float(test_out['best_f1']['threshold']):.2f}",
+            )
+            save_pr_curve_image(
+                final_test_dir / "pr_curve_test.png",
+                y_true=test_targets.astype(np.float32),
+                y_prob=test_probs.astype(np.float32),
+                title="Final Test Precision-Recall Curve",
+            )
+            save_roc_curve_image(
+                final_test_dir / "roc_curve_test.png",
+                y_true=test_targets.astype(np.float32),
+                y_prob=test_probs.astype(np.float32),
+                title="Final Test ROC Curve",
+            )
+
+            summary_rows = [
+                ("run_dir", str(run_dir)),
+                ("best_checkpoint", str(checkpoints_dir / "best.pt")),
+                ("best_epoch", best_epoch),
+                ("split_mode", split_mode),
+                ("train_jsons", len(train_paths)),
+                ("val_jsons", len(val_paths)),
+                ("test_jsons", len(test_paths)),
+                ("train_windows", len(train_ds)),
+                ("val_windows", len(val_ds)),
+                ("test_windows", len(test_ds)),
+                ("threshold_source", "validation_best_f1"),
+                ("selected_threshold", selected_threshold),
+                ("test_n_samples", int(test_out["n_samples"])),
+                ("test_n_pos", n_pos),
+                ("test_n_neg", n_neg),
+                ("test_auprc", safe_float(test_out["auprc"])),
+                ("test_auroc", safe_float(test_out["auroc"])),
+                ("selected_precision", safe_float(selected_stats["precision"])),
+                ("selected_recall", safe_float(selected_stats["recall"])),
+                ("selected_f1", safe_float(selected_stats["f1"])),
+                ("selected_accuracy", safe_float(selected_stats["accuracy"])),
+                ("selected_fpr", selected_fpr),
+                ("oracle_threshold", safe_float(test_out["best_f1"]["threshold"])),
+                ("oracle_precision", safe_float(oracle_stats["precision"])),
+                ("oracle_recall", safe_float(oracle_stats["recall"])),
+                ("oracle_f1", safe_float(oracle_stats["f1"])),
+                ("oracle_accuracy", safe_float(oracle_stats["accuracy"])),
+                ("oracle_fpr", oracle_fpr),
+                ("mean_prob_pos", safe_float(test_out["mean_prob_pos"])),
+                ("mean_prob_neg", safe_float(test_out["mean_prob_neg"])),
+            ]
+
+            save_summary_csv(final_test_dir / "summary.csv", summary_rows)
+
+            final_test_payload = {
+                "best_epoch": best_epoch,
+                "best_checkpoint": str(checkpoints_dir / "best.pt"),
+                "split_mode": split_mode,
+                "threshold_source": "validation_best_f1",
+                "selected_threshold": selected_threshold,
+                "split_counts": {
+                    "train_jsons": len(train_paths),
+                    "val_jsons": len(val_paths),
+                    "test_jsons": len(test_paths),
+                    "train_windows": len(train_ds),
+                    "val_windows": len(val_ds),
+                    "test_windows": len(test_ds),
+                },
+                "test_summary": {
+                    "n_samples": int(test_out["n_samples"]),
+                    "n_pos": n_pos,
+                    "n_neg": n_neg,
+                    "auprc": safe_float(test_out["auprc"]),
+                    "auroc": safe_float(test_out["auroc"]),
+                    "mean_prob_pos": safe_float(test_out["mean_prob_pos"]),
+                    "mean_prob_neg": safe_float(test_out["mean_prob_neg"]),
+                    "selected_threshold_stats": {
+                        **selected_stats,
+                        "fpr": selected_fpr,
+                    },
+                    "oracle_best_f1": test_out["best_f1"],
+                    "oracle_best_threshold_stats": {
+                        **oracle_stats,
+                        "fpr": oracle_fpr,
+                    },
+                },
+                "artifacts": {
+                    "summary_csv": str(final_test_dir / "summary.csv"),
+                    "per_file_csv": str(final_test_dir / "per_file.csv"),
+                    "roc_csv": str(final_test_dir / "roc.csv"),
+                    "pr_csv": str(final_test_dir / "pr.csv"),
+                    "threshold_sweep_csv": str(final_test_dir / "threshold_sweep.csv"),
+                },
+            }
+            (final_test_dir / "metrics.json").write_text(
+                json.dumps(final_test_payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"[FINAL TEST] AUPRC={test_out['auprc']:.4f} | AUROC={test_out['auroc']:.4f} "
+                f"| val_thr={selected_threshold:.2f} F1={selected_stats['f1']:.4f} "
+                f"| oracle_thr={float(test_out['best_f1']['threshold']):.2f} F1={oracle_stats['f1']:.4f}"
+            )
     print(f"[DONE] Best AUPRC: {best_auprc:.4f}")
     print(f"[DONE] Run saved to: {run_dir}")
 

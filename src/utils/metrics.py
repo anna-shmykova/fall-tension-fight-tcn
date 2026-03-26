@@ -1,14 +1,22 @@
 import numpy as np
 import csv
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import matplotlib.pyplot as plt
-from sklearn.metrics import precision_recall_curve, auc, roc_auc_score
+from sklearn.metrics import precision_recall_curve, roc_curve, auc, roc_auc_score
 
 
 # ---------------------------------------------------------
 # AUPRC (Area Under Precision-Recall Curve)
 # ---------------------------------------------------------
+def _compute_pr_curve(y_true: np.ndarray, y_prob: np.ndarray):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.size == 0 or not np.any(y_true == 1):
+        return None
+    return precision_recall_curve(y_true, y_prob)
+
+
 def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     """
     Compute AUPRC for binary classification.
@@ -22,7 +30,11 @@ def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     -------
     float : area under precision-recall curve
     """
-    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    pr_curve = _compute_pr_curve(y_true, y_prob)
+    if pr_curve is None:
+        return float("nan")
+
+    precision, recall, _ = pr_curve
     return auc(recall, precision)
 
 
@@ -32,6 +44,45 @@ def compute_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     if np.unique(y_true).size < 2:
         return float("nan")
     return float(roc_auc_score(y_true, y_prob))
+
+
+def compute_pr_points(y_true: np.ndarray, y_prob: np.ndarray) -> List[Dict[str, float]]:
+    pr_curve = _compute_pr_curve(y_true, y_prob)
+    if pr_curve is None:
+        return []
+
+    precision, recall, thresholds = pr_curve
+
+    rows: List[Dict[str, float]] = []
+    for idx, (p, r) in enumerate(zip(precision, recall)):
+        thr = float("nan") if idx == 0 else float(thresholds[idx - 1])
+        rows.append(
+            {
+                "precision": float(p),
+                "recall": float(r),
+                "threshold": thr,
+            }
+        )
+    return rows
+
+
+def compute_roc_points(y_true: np.ndarray, y_prob: np.ndarray) -> List[Dict[str, float]]:
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if np.unique(y_true).size < 2:
+        return []
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    rows: List[Dict[str, float]] = []
+    for fp_rate, tp_rate, thr in zip(fpr, tpr, thresholds):
+        rows.append(
+            {
+                "fpr": float(fp_rate),
+                "tpr": float(tp_rate),
+                "threshold": float(thr),
+            }
+        )
+    return rows
 
 
 # ---------------------------------------------------------
@@ -146,6 +197,24 @@ def save_threshold_sweep_csv(metrics_dir: Path, sweep: List[Dict[str, Any]]) -> 
         w.writerows(sweep)
 
 
+def save_rows_csv(out_path: Path, rows: List[Dict[str, Any]]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_summary_csv(out_path: Path, rows: List[Tuple[str, Any]]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        writer.writerows(rows)
+
+
 def save_learning_curves(out_dir: Path, history: List[Dict[str, Any]]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     if not history:
@@ -238,7 +307,11 @@ def save_confusion_matrix_image(out_path: Path, stats: Dict[str, float], title: 
 
 def save_pr_curve_image(out_path: Path, y_true: np.ndarray, y_prob: np.ndarray, title: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    pr_curve = _compute_pr_curve(y_true, y_prob)
+    if pr_curve is None:
+        return
+
+    precision, recall, _ = pr_curve
     auprc = compute_auprc(y_true, y_prob)
 
     plt.figure(figsize=(5.0, 4.0))
@@ -250,6 +323,29 @@ def save_pr_curve_image(out_path: Path, y_true: np.ndarray, y_prob: np.ndarray, 
     plt.ylim(0.0, 1.0)
     plt.grid(True)
     plt.legend(loc="lower left")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def save_roc_curve_image(out_path: Path, y_true: np.ndarray, y_prob: np.ndarray, title: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if np.unique(np.asarray(y_true)).size < 2:
+        return
+
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auroc = compute_auroc(y_true, y_prob)
+
+    plt.figure(figsize=(5.0, 4.0))
+    plt.plot(fpr, tpr, linewidth=2, label=f"AUROC={auroc:.4f}")
+    plt.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(title)
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.grid(True)
+    plt.legend(loc="lower right")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()

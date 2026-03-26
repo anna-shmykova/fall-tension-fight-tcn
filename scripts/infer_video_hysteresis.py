@@ -179,6 +179,10 @@ def load_yaml(path: Path) -> dict:
 
 
 def compute_auprc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.size == 0 or not np.any(y_true == 1):
+        return float("nan")
     precision, recall, _ = precision_recall_curve(y_true, y_prob)
     return float(auc(recall, precision))
 

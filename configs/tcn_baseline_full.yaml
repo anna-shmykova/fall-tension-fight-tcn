@@ -1,9 +1,9 @@
 exp:
-  name: tcn_causal_last_aggr_mlp_pool_motion_erez_RWF_loss_alpha_window_16_exclude_tens
+  name: tcn_causal_graph_last_aggr_mlp_pool_motion_RWF_erez_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:
-  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF  # change to your real json root
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF_erez  # change to your real json root
   runs_root: /home/anna/TCN_TRAIN/runs
 
 data:
@@ -20,12 +20,13 @@ data:
   kp_conf_keep: 0.3
 
   split:
-    mode: "fixed" #"generate"
+    mode: train_test_lists #"fixed" #"generate" codex resume 019d01bb-e3b5-7cb2-837a-6d40157793aa
     group_key: "video_id"
     seed: 42
     val_ratio: 0.2
-    train_list: "fixed_splits/train_paths.txt"
-    val_list: "fixed_splits/val_paths.txt"
+    train_list: "fixed_splits/train_videos_fixed.txt"
+    val_list: #"fixed_splits/val_paths.txt"
+    test_list: "fixed_splits/test_videos_fixed.txt"
 
 features:
   use_bbox: true
@@ -39,7 +40,7 @@ features:
 
 model:
   type: "tcn"
-  use_graph: false
+  use_graph: true
   use_attention_readout: false   # true forces attn; false uses pool_mode below
   causal: true
   norm: group   # group recommended for strict causality during training
@@ -50,7 +51,7 @@ model:
   dropout: 0.2
   mlp_out_dim: 32
   pool_mode: mean_max_std   # choices when attention is off: mean, max, mean_max, mean_max_std
-  tcn_input_mode: pooled_count_motion   # choices: pooled_count, pooled_count_motion
+  tcn_input_mode: pooled_count   # choices: pooled_count, pooled_count_motion
   motion_proj_dim: 32
 
 train:
