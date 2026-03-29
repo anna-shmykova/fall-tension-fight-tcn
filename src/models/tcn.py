@@ -204,7 +204,7 @@ class EventTCN(nn.Module):
 class MotionTCN(nn.Module):
     def __init__(
                     self,
-                    input_dim=18,
+                    input_dim=21,
                     num_classes=1,
                     hidden_dim=64,
                     num_layers=4,

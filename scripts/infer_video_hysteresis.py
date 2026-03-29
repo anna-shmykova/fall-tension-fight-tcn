@@ -16,6 +16,7 @@ from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 from ultralytics import YOLO
 
 from src.data.features import (
+    EREZ_MOTION_DIM,
     extract_erez_motion_features,
     frame_to_vector,
     motion_feature_cfg,
@@ -379,7 +380,7 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
     model_type = str(model_cfg.get("type", "tcn")).lower()
 
     if model_type in MOTION_ONLY_MODEL_TYPES:
-        input_dim = infer_input_dim_from_state_dict(state_dict, default_dim=18)
+        input_dim = infer_input_dim_from_state_dict(state_dict, default_dim=EREZ_MOTION_DIM)
         input_proj_dim = int(model_cfg.get("input_proj_dim", 0))
         if input_proj_dim == 0 and "input_proj.weight" in state_dict:
             input_proj_dim = int(state_dict["input_proj.weight"].shape[0])

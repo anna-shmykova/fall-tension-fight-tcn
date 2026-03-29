@@ -1,14 +1,36 @@
+"""     Extract order-free motion features from JSON frame sequences.
+    This file converts per-frame detections/keypoints into a clip-level motion
+    representation. The main entry point is `extract_motion_features(...)`, which
+    builds one 21-dim feature vector for each pair of consecutive frames.
+    Feature order:
+    1.  d_mean_center_x      : change in mean bbox center x; global horizontal crowd motion
+    2.  d_mean_center_y      : change in mean bbox center y; global vertical crowd motion
+    3.  d_var_center_x       : change in bbox-center variance on x; horizontal spread/compression
+    4.  d_var_center_y       : change in bbox-center variance on y; vertical spread/compression
+    5.  d_mean_size_w        : change in mean bbox width; average scale/depth change
+    6.  d_mean_size_h        : change in mean bbox height; average scale/depth change
+    7.  d_max_size_w         : change in largest bbox width; strongest scale change
+    8.  d_max_size_h         : change in largest bbox height; strongest scale change
+    9.  d_mean_pairwise      : change in mean pairwise bbox-center distance; crowd density cue
+    10. d_var_pairwise       : change in variance of pairwise distances; spacing heterogeneity
+    11. d_kp_mean_x          : change in mean keypoint x; global articulated horizontal motion
+    12. d_kp_mean_y          : change in mean keypoint y; global articulated vertical motion
+    13. d_kp_var_x           : change in keypoint variance on x; pose spread horizontally
+    14. d_kp_var_y           : change in keypoint variance on y; pose spread vertically
+    15. bb_nn_mean           : mean nearest-neighbor bbox-center motion; average object motion
+    16. bb_nn_max            : max nearest-neighbor bbox-center motion; strongest mover
+    17. kp_nn_mean           : mean nearest-neighbor keypoint motion; average articulated motion
+    18. kp_nn_max            : max nearest-neighbor keypoint motion; strongest articulated motion
+    #*  added later (14/03/26)
+    19. d_union_coverage     : change in union area covered by all bboxes
+    20. d_mean_pairwise_iou  : change in mean pairwise bbox IoU
+    21. d_max_pairwise_iou   : change in max pairwise bbox IoU
+"""
+
 import numpy as np
-try:
-    from .json_utils import load_json_data
-    from .my_local_utils import print_color
-except ImportError:
-    from json_utils import load_json_data
-    from my_local_utils import print_color
-# BB_KP_TAG = 'bbs_list_of_keypoints'
+
 N_Keypoints = 17
 DEFAULT_VERSION = 2.0
-
 
 # --------------------------------------------------
 # * public fucntion, to be used by other units
@@ -20,15 +42,14 @@ def extract_motion_features(frames, j_version:float=DEFAULT_VERSION): # **kwargs
     frame_feats = []
     raw_points = []
 
-    # kp_conf = True if 2.0 <= float(kwargs.get('version', DEFAULT_VERSION) ) else False
     kp_conf = True if j_version >= 2.0 else False
 
     for frm in frames:
         if len(frm['detections_list']) > 0:
             pass
             # print_color(frm)
-        bb_centers, bb_sizes, keypoints = extract_frame_geometry(frm, kp_conf=kp_conf)
-        agg = frame_aggregates(bb_centers, bb_sizes, keypoints)
+        bb_centers, bb_sizes, keypoints, bboxes = extract_frame_geometry(frm, kp_conf=kp_conf)
+        agg = frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes)
         frame_feats.append(agg)
         raw_points.append((bb_centers, keypoints))
 
@@ -48,7 +69,6 @@ def extract_motion_features(frames, j_version:float=DEFAULT_VERSION): # **kwargs
                                      np.array([bb_mean, bb_max, kp_mean, kp_max], dtype=np.float32),])
         motion_feats.append(motion_vec)
 
-    # print_color("motion_feats"); print_color(np.stack(motion_feats))
     return np.stack(motion_feats)  # (T-1) x C'
 
 
@@ -64,6 +84,7 @@ def extract_frame_geometry(frame, **kwargs):
     Returns:  bb_centers: (N, 2)
               bb_sizes:   (N, 2)
               keypoints:  (M, 2)  -- flattened over all people
+              bboxes:     (N, 4)  -- [x1, y1, x2, y2]
     """
     #* vec_kp - key point vector length, may have 2 elements v = [x, y] or 3 v = [x, y, conf]
     #* There are 2 options to set KP vector length (i) pass the value directly by vec_kp
@@ -72,7 +93,7 @@ def extract_frame_geometry(frame, **kwargs):
     vec_kp = kwargs.get('vec_kp', 3 if kwargs.get('kp_conf', True) else 2)
     # vec_kp = 3 if kwargs.get('vec_kp', DEFAULT_VERSION) > 2.0 else 2
 
-    bb_centers, bb_sizes, keypoints = [], [], []
+    bb_centers, bb_sizes, keypoints, bboxes = [], [], [], []
 
     # for bb in frame.get('bbs_list_of_keypoints', []):
     #     # * bounding box
@@ -85,8 +106,9 @@ def extract_frame_geometry(frame, **kwargs):
 
         bb_sizes.append([w, h])
         bb_centers.append([cx, cy])
+        bboxes.append([x1, y1, x2, y2])
 
-        ## kps = bb[6]  #* keypoints (13 points, aligned)
+        # kps = bb[6]  #* keypoints (13 points, aligned)
         kps = det['key_pts']
         for i in range(0, len(kps), vec_kp):
             x, y = kps[i], kps[i + 1]
@@ -97,11 +119,72 @@ def extract_frame_geometry(frame, **kwargs):
 
     return (np.asarray(bb_centers, dtype=np.float32),
             np.asarray(bb_sizes  , dtype=np.float32),
-            np.asarray(keypoints , dtype=np.float32),)
+            np.asarray(keypoints , dtype=np.float32),
+            np.asarray(bboxes    , dtype=np.float32),)
+
+
+def _bbox_union_area(bboxes):
+    """ Compute exact union area of axis-aligned boxes clipped to [0, 1]."""
+    if len(bboxes) == 0:
+        return 0.0
+
+    boxes = np.asarray(bboxes, dtype=np.float64).copy()
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, 1.0)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, 1.0)
+    boxes = boxes[(boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])]
+    if len(boxes) == 0:
+        return 0.0
+
+    xs = np.unique(boxes[:, [0, 2]])
+    area = 0.0
+    for i in range(len(xs) - 1):
+        x_l, x_r = xs[i], xs[i + 1]
+        if x_r <= x_l:
+            continue
+        active = boxes[(boxes[:, 0] < x_r) & (boxes[:, 2] > x_l)]
+        if len(active) == 0:
+            continue
+
+        ys = sorted((y1, y2) for _, y1, _, y2 in active)
+        covered = 0.0
+        cur_y1, cur_y2 = ys[0]
+        for y1, y2 in ys[1:]:
+            if y1 <= cur_y2:
+                cur_y2 = max(cur_y2, y2)
+            else:
+                covered += cur_y2 - cur_y1
+                cur_y1, cur_y2 = y1, y2
+        covered += cur_y2 - cur_y1
+        area += (x_r - x_l) * covered
+
+    return float(area)
+
+
+def _pairwise_iou_stats(bboxes):
+    """Return mean/max pairwise IoU for a set of axis-aligned boxes."""
+    if len(bboxes) < 2:
+        return 0.0, 0.0
+
+    vals = []
+    boxes = np.asarray(bboxes, dtype=np.float64)
+    for i in range(len(boxes)):
+        x1a, y1a, x2a, y2a = boxes[i]
+        area_a = max(0.0, x2a - x1a) * max(0.0, y2a - y1a)
+        for j in range(i + 1, len(boxes)):
+            x1b, y1b, x2b, y2b = boxes[j]
+            area_b = max(0.0, x2b - x1b) * max(0.0, y2b - y1b)
+            ix1, iy1 = max(x1a, x1b), max(y1a, y1b)
+            ix2, iy2 = min(x2a, x2b), min(y2a, y2b)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            union = area_a + area_b - inter
+            vals.append(0.0 if union <= 0 else inter / union)
+
+    vals = np.asarray(vals, dtype=np.float32)
+    return float(vals.mean()), float(vals.max())
 
 
 # *****  Step 2: compute per-frame aggregate descriptors
-def frame_aggregates(bb_centers, bb_sizes, keypoints):
+def frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes):
     """ Compute order-free, tracking-free aggregates for one frame.
         Returns a 1D feature vector.
     """
@@ -126,10 +209,12 @@ def frame_aggregates(bb_centers, bb_sizes, keypoints):
         else:
             mean_pairwise = 0.0
             var_pairwise = 0.0
+        union_coverage = _bbox_union_area(bboxes)
+        mean_pairwise_iou, max_pairwise_iou = _pairwise_iou_stats(bboxes)
     else:
         mean_center = var_center = mean_size = max_size = np.zeros(2)
-        mean_pairwise = var_pairwise =0.0
-        # var_pairwise = 0.0
+        mean_pairwise = var_pairwise = 0.0
+        union_coverage = mean_pairwise_iou = max_pairwise_iou = 0.0
 
     feats.extend(mean_center)
     feats.extend(var_center)
@@ -137,6 +222,9 @@ def frame_aggregates(bb_centers, bb_sizes, keypoints):
     feats.extend(max_size)
     feats.append(mean_pairwise)
     feats.append(var_pairwise)
+    feats.append(union_coverage)
+    feats.append(mean_pairwise_iou)
+    feats.append(max_pairwise_iou)
 
     #* keypoints
     if len(keypoints) > 0:
@@ -221,7 +309,7 @@ def get_empty_frame():
 
 def generate_random_frame(n_bb=10, version=DEFAULT_VERSION):
     """     Generate a synthetic frame in the unified dict format.  """
-    ## bbs = []
+
     kp_conf = True if float(version) >= 2.0 else False
     C_min = 0.3 #* minimal confidence for keypoint
     detections = []
@@ -249,20 +337,6 @@ def generate_random_frame(n_bb=10, version=DEFAULT_VERSION):
 
 def shift_frame(frame, dx=0.1, dy=0.1, vec_kp=(3 if DEFAULT_VERSION >= 2.0  else 2)):
     """ Shift all bounding boxes and keypoints by (dx, dy).  """
-    # shifted = {BB_KP_TAG: []}
-    #
-    # for bb in frame[BB_KP_TAG]:
-    #     x1, y1, x2, y2 = bb[2] + dx, bb[3] + dy, bb[4] + dx, bb[5] + dy
-    #
-    #     kps = bb[6]
-    #     shifted_kps = []
-    #     for i in range(0, len(kps), 2):
-    #         shifted_kps.extend([kps[i] + dx, kps[i + 1] + dy ])
-    #
-    #     shifted[BB_KP_TAG].append([bb[0], bb[1], x1, y1, x2, y2, shifted_kps ])
-    #
-    # return shifted
-
 
     shifted = {'f':frame['f'], 't':frame['t'], 'group_events': frame['group_events'], 'detections_list':[]}
 
@@ -273,15 +347,13 @@ def shift_frame(frame, dx=0.1, dy=0.1, vec_kp=(3 if DEFAULT_VERSION >= 2.0  else
         kps = det['key_pts']
         new_kps = []
         for i in range(0, len(kps), vec_kp):
-            # new_kps.extend([kps[i] + dx, kps[i + 1] + dy])
             new_kps += [kps[i] + dx, kps[i + 1] + dy]
             if vec_kp == 3:
                 new_kps += [kps[i+2]]
         shifted['detections_list'].append({'class': det['class'],
                                            'conf': det['conf'],
                                            'bbox': new_bbox,
-                                           'key_pts': new_kps,
-                                           })
+                                           'key_pts': new_kps,})
     return shifted
 
 
@@ -291,20 +363,17 @@ def controlled_motion_test(dx=0.1, dy=0.1, eps=1e-5, **kwargs):
     frame_1 = shift_frame(frame_0, dx=dx, dy=dy)
 
     #* --- geometry extraction ---
-    bb0, _, _ = extract_frame_geometry(frame_0, kp_conf=KP_CONF_TST)
-    bb1, _, _ = extract_frame_geometry(frame_1, kp_conf=KP_CONF_TST)
+    bb0, _, _, boxes0 = extract_frame_geometry(frame_0, kp_conf=KP_CONF_TST)
+    bb1, _, _, boxes1 = extract_frame_geometry(frame_1, kp_conf=KP_CONF_TST)
     #* --- aggregate check ---
-    agg0 = frame_aggregates(bb0, np.zeros_like(bb0), np.zeros((0, 2)))
-    agg1 = frame_aggregates(bb1, np.zeros_like(bb1), np.zeros((0, 2)))
+    agg0 = frame_aggregates(bb0, np.zeros_like(bb0), np.zeros((0, 2)), boxes0)
+    agg1 = frame_aggregates(bb1, np.zeros_like(bb1), np.zeros((0, 2)), boxes1)
     delta = agg1 - agg0
-
     #* --- indices depend on feature order:
     delta_mean_center = delta[0:2]    #* mean_center = feats[0:2]
-
     #*  pairwise distance stats
     mean_pairwise_idx = 8
     var_pairwise_idx = 9
-
     #* --- nearest neighbor motion ---
     nn_mean, nn_max = nearest_neighbor_motion(bb0, bb1)
 
@@ -333,7 +402,7 @@ def crowd_compression_test(scl=0.5, **kwargs): #72
     frame_0 = generate_random_frame(n_bb=kwargs.get('n_bb', 10))
     #* extract centers
     # bb0, _, _ = extract_frame_geometry(frame_0)
-    bb0, bb_sizes0, kp0 = extract_frame_geometry(frame_0)
+    bb0, bb_sizes0, kp0, boxes0 = extract_frame_geometry(frame_0)
     centroid = bb0.mean(axis=0)
 
     #* build compressed frame
@@ -355,20 +424,6 @@ def crowd_compression_test(scl=0.5, **kwargs): #72
         nx1, ny1 = (new_cx - w/2), (new_cy - h/2)
         nx2, ny2 = (new_cx + w/2), (new_cy + h/2)
 
-        #* shift keypoints accordingly
-        # shifted_kps = []
-        # # for i in range(0, len(det[6]), 2):
-        # #     kx, ky = det[6][i], det[6][i + 1]
-        # for kp in range(0, len(det['key_pts']), 2):
-        #     kx, ky = det[6][i], det[6][i + 1]
-        #     dkx = kx - cx
-        #     dky = ky - cy
-        #     shifted_kps.extend([new_cx + scale*dkx,  new_cy + scale*dky ])
-        # compressed['detections_list'].append([det[0], det[1], nx1, ny1, nx2, ny2, shifted_kps])
-
-        #* shift keypoints consistently with bbox scaling toward centroid
-        # vec_kp = (3 if DEFAULT_ VERSION >= 2.0 else 2)
-
         kps_shift = []
         kps = det.get('key_pts', [])
         for i in range(0, len(kps), KP_VEC_TST):
@@ -383,14 +438,12 @@ def crowd_compression_test(scl=0.5, **kwargs): #72
                                           'bbox': [nx1, ny1, nx2, ny2],
                                           'key_pts': kps_shift,}]
 
-    bb1, bb_sizes1, kp1 = extract_frame_geometry(compressed, vec_kp=KP_VEC_TST)
+    bb1, bb_sizes1, kp1, boxes1 = extract_frame_geometry(compressed, vec_kp=KP_VEC_TST)
 
-    agg0 = frame_aggregates(bb0, bb_sizes0, kp0)
-    agg1 = frame_aggregates(bb1, bb_sizes1, kp1)
+    agg0 = frame_aggregates(bb0, bb_sizes0, kp0, boxes0)
+    agg1 = frame_aggregates(bb1, bb_sizes1, kp1, boxes1)
 
-    mean_pairwise_idx = 8
-    # var_pairwise_idx = 9
-
+    mean_pairwise_idx = 8      # var_pairwise_idx = 9
     delta_mean_center = agg1[0:2] - agg0[0:2]
 
     print(f"* Crowd Compression Test\n"
@@ -431,22 +484,26 @@ def test_motion_sequence(tst_json:dict, eps= 1e-5):
     # * check (1): shape is stable
     print(f"Number of frames: {len(frames)}\nMotion Shape: {motion_seq.shape}")
     print(f"Correct shape:",  len(frames) - 1 ==  motion_seq.shape[0])
-
     # * check (2): calculation  consistency
     ms2 = extract_motion_features(frames, j_version=j_version)
     assert np.allclose(motion_seq, ms2)
-
     # * check (3): Static (Zero motion)
     ms_0 = extract_motion_features(generate_static_json()['frames'])
     print(f"\n* Static motion tensor: mean = {ms_0.mean()}, max = {abs(ms_0.max())}, sum = {ms_0.sum()}\n")
     assert ms_0.max() < eps
-    # json.dump(static_example, static_json_)
 
     controlled_motion_test()
     crowd_compression_test()
 
 
 if __name__ == '__main__':
+    try:
+        from .json_utils import load_json_data
+        from .my_local_utils import print_color
+    except ImportError:
+        from json_utils import load_json_data
+        from my_local_utils import print_color
+
     # json_example = "/mnt/local-data/Projects/Wesmart/data/usual_jsons_from_events/event_18.json"
     json_example = "data/json_data/full_ann_w_keys/new_21_1_keypoints.json"
     json_newfrmt = "data/json_data/jsons_nf/cam3_5_4.json"
@@ -458,5 +515,5 @@ if __name__ == '__main__':
     print_color("✔✔✔ New Format OK !\n", 'g')
 
     pass
-#377(,,2)
-#480(,8,4)->
+
+#480(,8,4)-> 417(,,3)

@@ -8,7 +8,7 @@ from src.data.labels import events_to_label
 from src.erez_files.analyze_json_motion import extract_motion_features
 
 
-MOTION_FEATURE_DIM = 18
+MOTION_FEATURE_DIM = 21
 
 
 def adapt_frame_for_erez(frame: Dict[str, Any]) -> Dict[str, Any]:
