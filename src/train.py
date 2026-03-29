@@ -23,6 +23,8 @@ from src.data.splits import (
     write_split_files,
 )
 from src.data.dataset import EventJsonDataset, MotionJsonDataset
+from src.data.json_io import read_json_frames
+from src.data.labels import events_to_label
 from src.data.features import motion_feature_dim
 from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
@@ -162,6 +164,7 @@ def build_dataset(
     feature_cfg: Dict[str, Any],
     label_cfg: Dict[str, Any],
     target_mode: str,
+    verbose: bool = True,
 ):
     return dataset_cls(
         paths,
@@ -171,6 +174,7 @@ def build_dataset(
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
         target_mode=target_mode,
+        verbose=verbose,
     )
 
 
@@ -188,6 +192,203 @@ def safe_float(value: Any) -> float:
 def fpr_from_stats(stats: Dict[str, float]) -> float:
     denom = float(stats["fp"] + stats["tn"])
     return float(stats["fp"] / denom) if denom > 0 else float("nan")
+
+
+def infer_video_label(json_path: str, label_cfg: Dict[str, Any]) -> Dict[str, int]:
+    frames = read_json_frames(json_path)
+    frame_labels = np.asarray([events_to_label(frame, cfg=label_cfg) for frame in frames], dtype=np.int32)
+    n_frames = int(len(frame_labels))
+    n_pos_frames = int(np.sum(frame_labels == 1))
+    n_neg_frames = int(np.sum(frame_labels == 0))
+    return {
+        "video_label": int(n_pos_frames > 0),
+        "n_frames": n_frames,
+        "n_pos_frames": n_pos_frames,
+        "n_neg_frames": n_neg_frames,
+    }
+
+
+def summarize_binary_scores(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    selected_threshold: float | None = None,
+) -> Dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_prob = np.asarray(y_prob, dtype=np.float32)
+
+    if y_true.size == 0:
+        empty_threshold = float("nan") if selected_threshold is None else float(selected_threshold)
+        empty_stats = {
+            "threshold": empty_threshold,
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "accuracy": float("nan"),
+            "tp": 0,
+            "fp": 0,
+            "tn": 0,
+            "fn": 0,
+        }
+        return {
+            "n_samples": 0,
+            "n_pos": 0,
+            "n_neg": 0,
+            "auprc": float("nan"),
+            "auroc": float("nan"),
+            "mean_prob_pos": float("nan"),
+            "mean_prob_neg": float("nan"),
+            "selected_threshold": empty_threshold,
+            "selected_threshold_stats": {
+                **empty_stats,
+                "fpr": float("nan"),
+            },
+            "oracle_best_f1": {
+                "threshold": float("nan"),
+                "precision": float("nan"),
+                "recall": float("nan"),
+                "f1": float("nan"),
+                "tp": 0.0,
+                "fp": 0.0,
+                "fn": 0.0,
+            },
+            "oracle_best_threshold_stats": {
+                **empty_stats,
+                "fpr": float("nan"),
+            },
+            "sweep": [],
+        }
+
+    auprc = compute_auprc(y_true, y_prob)
+    auroc = compute_auroc(y_true, y_prob)
+    pos_mask = y_true == 1
+    neg_mask = y_true == 0
+    sweep = threshold_sweep_binary(y_true, y_prob, start=0.01, end=0.99, step=0.01)
+    best = max(sweep, key=lambda row: row["f1"])
+    oracle_stats = confusion_stats_at_threshold(y_true, y_prob, threshold=float(best["threshold"]))
+
+    resolved_threshold = selected_threshold
+    if resolved_threshold is None or not np.isfinite(float(resolved_threshold)):
+        resolved_threshold = float(best["threshold"])
+    resolved_threshold = float(resolved_threshold)
+    selected_stats = confusion_stats_at_threshold(y_true, y_prob, threshold=resolved_threshold)
+
+    return {
+        "n_samples": int(len(y_true)),
+        "n_pos": int(np.sum(pos_mask)),
+        "n_neg": int(np.sum(neg_mask)),
+        "auprc": safe_float(auprc),
+        "auroc": safe_float(auroc),
+        "mean_prob_pos": float(np.mean(y_prob[pos_mask])) if np.any(pos_mask) else float("nan"),
+        "mean_prob_neg": float(np.mean(y_prob[neg_mask])) if np.any(neg_mask) else float("nan"),
+        "selected_threshold": resolved_threshold,
+        "selected_threshold_stats": {
+            **selected_stats,
+            "fpr": fpr_from_stats(selected_stats),
+        },
+        "oracle_best_f1": {key: float(value) for key, value in best.items()},
+        "oracle_best_threshold_stats": {
+            **oracle_stats,
+            "fpr": fpr_from_stats(oracle_stats),
+        },
+        "sweep": sweep,
+    }
+
+
+def summarize_video_scores(
+    rows: List[Dict[str, Any]],
+    *,
+    score_key: str,
+    selected_threshold: float | None = None,
+) -> Dict[str, Any]:
+    valid_rows = [row for row in rows if np.isfinite(safe_float(row.get(score_key, float("nan"))))]
+    y_true = np.asarray([int(row["video_label"]) for row in valid_rows], dtype=np.int32)
+    y_prob = np.asarray([float(row[score_key]) for row in valid_rows], dtype=np.float32)
+    summary = summarize_binary_scores(y_true, y_prob, selected_threshold=selected_threshold)
+    summary["score_key"] = score_key
+    summary["n_videos_total"] = int(len(rows))
+    summary["n_videos_eval"] = int(len(valid_rows))
+    return summary
+
+
+def predict_from_score(score: Any, threshold: Any) -> int | None:
+    score_f = safe_float(score)
+    threshold_f = safe_float(threshold)
+    if not np.isfinite(score_f) or not np.isfinite(threshold_f):
+        return None
+    return int(score_f >= threshold_f)
+
+
+def build_per_video_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    threshold_mean: float,
+    threshold_max: float,
+) -> List[Dict[str, Any]]:
+    per_video_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        per_video_rows.append(
+            {
+                "json_path": row["json_path"],
+                "json_name": row["json_name"],
+                "video_label": int(row["video_label"]),
+                "n_frames": int(row["n_frames"]),
+                "n_pos_frames": int(row["n_pos_frames"]),
+                "n_neg_frames": int(row["n_neg_frames"]),
+                "n_windows": int(row["n_windows"]),
+                "n_pos_windows": int(row["n_pos"]),
+                "n_neg_windows": int(row["n_neg"]),
+                "video_score_mean": safe_float(row["video_score_mean"]),
+                "val_video_threshold_mean": safe_float(threshold_mean),
+                "video_pred_mean_at_val_thr": predict_from_score(row["video_score_mean"], threshold_mean),
+                "video_score_max": safe_float(row["video_score_max"]),
+                "val_video_threshold_max": safe_float(threshold_max),
+                "video_pred_max_at_val_thr": predict_from_score(row["video_score_max"], threshold_max),
+            }
+        )
+    return per_video_rows
+
+
+def evaluate_paths_individually(
+    model: nn.Module,
+    dataset_cls,
+    paths: List[str],
+    *,
+    K: int,
+    window_size: int,
+    window_step: int,
+    feature_cfg: Dict[str, Any],
+    label_cfg: Dict[str, Any],
+    target_mode: str,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+    agg_mode: str,
+    temperature: float,
+    selected_threshold: float,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for json_path in paths:
+        rows.append(
+            evaluate_single_path(
+                model,
+                dataset_cls,
+                json_path,
+                K=K,
+                window_size=window_size,
+                window_step=window_step,
+                feature_cfg=feature_cfg,
+                label_cfg=label_cfg,
+                target_mode=target_mode,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                device=device,
+                agg_mode=agg_mode,
+                temperature=temperature,
+                selected_threshold=selected_threshold,
+            )
+        )
+    return rows
 
 
 def evaluate_single_path(
@@ -208,6 +409,11 @@ def evaluate_single_path(
     temperature: float,
     selected_threshold: float,
 ) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "json_path": json_path,
+        "json_name": Path(json_path).name,
+        **infer_video_label(json_path, label_cfg),
+    }
     ds = build_dataset(
         dataset_cls,
         [json_path],
@@ -217,12 +423,9 @@ def evaluate_single_path(
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
         target_mode=target_mode,
+        verbose=False,
     )
-    row: Dict[str, Any] = {
-        "json_path": json_path,
-        "json_name": Path(json_path).name,
-        "n_windows": int(len(ds)),
-    }
+    row["n_windows"] = int(len(ds))
     if len(ds) == 0:
         row.update(
             {
@@ -240,6 +443,8 @@ def evaluate_single_path(
                 "oracle_f1": float("nan"),
                 "mean_prob_pos": float("nan"),
                 "mean_prob_neg": float("nan"),
+                "video_score_mean": float("nan"),
+                "video_score_max": float("nan"),
             }
         )
         return row
@@ -265,6 +470,8 @@ def evaluate_single_path(
             "oracle_f1": safe_float(out["best_f1"]["f1"]),
             "mean_prob_pos": safe_float(out["mean_prob_pos"]),
             "mean_prob_neg": safe_float(out["mean_prob_neg"]),
+            "video_score_mean": safe_float(np.mean(probs)),
+            "video_score_max": safe_float(np.max(probs)),
         }
     )
     return row
@@ -817,28 +1024,60 @@ def main() -> None:
             roc_rows = compute_roc_points(test_targets, test_probs)
             pr_rows = compute_pr_points(test_targets, test_probs)
 
-            per_file_rows: List[Dict[str, Any]] = []
-            print(f"[INFO] Evaluating {len(test_paths)} held-out test files for per-file report")
-            for json_path in test_paths:
-                per_file_rows.append(
-                    evaluate_single_path(
-                        model,
-                        dataset_cls,
-                        json_path,
-                        K=K,
-                        window_size=window_size,
-                        window_step=window_step,
-                        feature_cfg=feature_cfg,
-                        label_cfg=label_cfg,
-                        target_mode=target_mode,
-                        batch_size=bs,
-                        num_workers=num_workers,
-                        device=device,
-                        agg_mode=agg_mode,
-                        temperature=temperature,
-                        selected_threshold=selected_threshold,
-                    )
-                )
+            print(f"[INFO] Evaluating {len(val_paths)} validation files for video-level threshold selection")
+            val_path_rows = evaluate_paths_individually(
+                model,
+                dataset_cls,
+                val_paths,
+                K=K,
+                window_size=window_size,
+                window_step=window_step,
+                feature_cfg=feature_cfg,
+                label_cfg=label_cfg,
+                target_mode=target_mode,
+                batch_size=bs,
+                num_workers=num_workers,
+                device=device,
+                agg_mode=agg_mode,
+                temperature=temperature,
+                selected_threshold=selected_threshold,
+            )
+            print(f"[INFO] Evaluating {len(test_paths)} held-out test files for per-file/video report")
+            per_file_rows = evaluate_paths_individually(
+                model,
+                dataset_cls,
+                test_paths,
+                K=K,
+                window_size=window_size,
+                window_step=window_step,
+                feature_cfg=feature_cfg,
+                label_cfg=label_cfg,
+                target_mode=target_mode,
+                batch_size=bs,
+                num_workers=num_workers,
+                device=device,
+                agg_mode=agg_mode,
+                temperature=temperature,
+                selected_threshold=selected_threshold,
+            )
+
+            val_video_mean = summarize_video_scores(val_path_rows, score_key="video_score_mean")
+            val_video_max = summarize_video_scores(val_path_rows, score_key="video_score_max")
+            test_video_mean = summarize_video_scores(
+                per_file_rows,
+                score_key="video_score_mean",
+                selected_threshold=float(val_video_mean["selected_threshold"]),
+            )
+            test_video_max = summarize_video_scores(
+                per_file_rows,
+                score_key="video_score_max",
+                selected_threshold=float(val_video_max["selected_threshold"]),
+            )
+            per_video_rows = build_per_video_rows(
+                per_file_rows,
+                threshold_mean=float(test_video_mean["selected_threshold"]),
+                threshold_max=float(test_video_max["selected_threshold"]),
+            )
 
             n_pos = int(np.sum(test_targets == 1))
             n_neg = int(np.sum(test_targets == 0))
@@ -847,6 +1086,7 @@ def main() -> None:
 
             save_threshold_sweep_csv(final_test_dir, test_out["sweep"])
             save_rows_csv(final_test_dir / "per_file.csv", per_file_rows)
+            save_rows_csv(final_test_dir / "per_video.csv", per_video_rows)
             if roc_rows:
                 save_rows_csv(final_test_dir / "roc.csv", roc_rows)
             if pr_rows:
@@ -906,6 +1146,28 @@ def main() -> None:
                 ("oracle_fpr", oracle_fpr),
                 ("mean_prob_pos", safe_float(test_out["mean_prob_pos"])),
                 ("mean_prob_neg", safe_float(test_out["mean_prob_neg"])),
+                ("video_mean_threshold_source", "validation_video_best_f1"),
+                ("video_mean_selected_threshold", safe_float(test_video_mean["selected_threshold"])),
+                ("video_mean_n_videos_eval", int(test_video_mean["n_videos_eval"])),
+                ("video_mean_n_pos", int(test_video_mean["n_pos"])),
+                ("video_mean_n_neg", int(test_video_mean["n_neg"])),
+                ("video_mean_auprc", safe_float(test_video_mean["auprc"])),
+                ("video_mean_auroc", safe_float(test_video_mean["auroc"])),
+                ("video_mean_precision", safe_float(test_video_mean["selected_threshold_stats"]["precision"])),
+                ("video_mean_recall", safe_float(test_video_mean["selected_threshold_stats"]["recall"])),
+                ("video_mean_f1", safe_float(test_video_mean["selected_threshold_stats"]["f1"])),
+                ("video_mean_accuracy", safe_float(test_video_mean["selected_threshold_stats"]["accuracy"])),
+                ("video_max_threshold_source", "validation_video_best_f1"),
+                ("video_max_selected_threshold", safe_float(test_video_max["selected_threshold"])),
+                ("video_max_n_videos_eval", int(test_video_max["n_videos_eval"])),
+                ("video_max_n_pos", int(test_video_max["n_pos"])),
+                ("video_max_n_neg", int(test_video_max["n_neg"])),
+                ("video_max_auprc", safe_float(test_video_max["auprc"])),
+                ("video_max_auroc", safe_float(test_video_max["auroc"])),
+                ("video_max_precision", safe_float(test_video_max["selected_threshold_stats"]["precision"])),
+                ("video_max_recall", safe_float(test_video_max["selected_threshold_stats"]["recall"])),
+                ("video_max_f1", safe_float(test_video_max["selected_threshold_stats"]["f1"])),
+                ("video_max_accuracy", safe_float(test_video_max["selected_threshold_stats"]["accuracy"])),
             ]
 
             save_summary_csv(final_test_dir / "summary.csv", summary_rows)
@@ -942,9 +1204,29 @@ def main() -> None:
                         "fpr": oracle_fpr,
                     },
                 },
+                "video_level": {
+                    "threshold_source": "validation_video_best_f1",
+                    "validation": {
+                        "mean_score": {
+                            key: value for key, value in val_video_mean.items() if key != "sweep"
+                        },
+                        "max_score": {
+                            key: value for key, value in val_video_max.items() if key != "sweep"
+                        },
+                    },
+                    "test": {
+                        "mean_score": {
+                            key: value for key, value in test_video_mean.items() if key != "sweep"
+                        },
+                        "max_score": {
+                            key: value for key, value in test_video_max.items() if key != "sweep"
+                        },
+                    },
+                },
                 "artifacts": {
                     "summary_csv": str(final_test_dir / "summary.csv"),
                     "per_file_csv": str(final_test_dir / "per_file.csv"),
+                    "per_video_csv": str(final_test_dir / "per_video.csv"),
                     "roc_csv": str(final_test_dir / "roc.csv"),
                     "pr_csv": str(final_test_dir / "pr.csv"),
                     "threshold_sweep_csv": str(final_test_dir / "threshold_sweep.csv"),
@@ -958,6 +1240,12 @@ def main() -> None:
                 f"[FINAL TEST] AUPRC={test_out['auprc']:.4f} | AUROC={test_out['auroc']:.4f} "
                 f"| val_thr={selected_threshold:.2f} F1={selected_stats['f1']:.4f} "
                 f"| oracle_thr={float(test_out['best_f1']['threshold']):.2f} F1={oracle_stats['f1']:.4f}"
+            )
+            print(
+                f"[FINAL TEST VIDEO] mean_thr={float(test_video_mean['selected_threshold']):.2f} "
+                f"F1={test_video_mean['selected_threshold_stats']['f1']:.4f} | "
+                f"max_thr={float(test_video_max['selected_threshold']):.2f} "
+                f"F1={test_video_max['selected_threshold_stats']['f1']:.4f}"
             )
     print(f"[DONE] Best AUPRC: {best_auprc:.4f}")
     print(f"[DONE] Run saved to: {run_dir}")

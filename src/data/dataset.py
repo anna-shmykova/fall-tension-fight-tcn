@@ -17,12 +17,13 @@ def resolve_target_index(window_size: int, target_mode: str) -> int:
 
 class _BaseWindowDataset(Dataset):
     def __init__(self, json_paths, K, sequence_builder,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center", verbose=True):
         self.samples = []
         self.window_size = window_size
         self.window_step = window_step
         self.K = K
         self.feature_cfg = feature_cfg or {}
+        self.verbose = bool(verbose)
         self.target_mode = str(target_mode).lower()
         self.target_index = resolve_target_index(window_size=self.window_size, target_mode=self.target_mode)
 
@@ -47,7 +48,8 @@ class _BaseWindowDataset(Dataset):
                 else:
                     continue
                 
-        print(f"Total windows ({self.target_mode} target):", len(self.samples))
+        if self.verbose:
+            print(f"Total windows ({self.target_mode} target):", len(self.samples))
 
     def __len__(self):
         return len(self.samples)
@@ -61,7 +63,7 @@ class _BaseWindowDataset(Dataset):
 
 class EventJsonDataset(_BaseWindowDataset):
     def __init__(self, json_paths, K,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center", verbose=True):
         super().__init__(
             json_paths=json_paths,
             K=K,
@@ -72,12 +74,13 @@ class EventJsonDataset(_BaseWindowDataset):
             label_cfg=label_cfg,
             window_cfg=window_cfg,
             target_mode=target_mode,
+            verbose=verbose,
         )
 
 
 class MotionJsonDataset(_BaseWindowDataset):
     def __init__(self, json_paths, K,
-                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center"):
+                 window_size=16, window_step=4, feature_cfg=None, label_cfg=None, window_cfg=None, target_mode="center", verbose=True):
         super().__init__(
             json_paths=json_paths,
             K=K,
@@ -88,4 +91,5 @@ class MotionJsonDataset(_BaseWindowDataset):
             label_cfg=label_cfg,
             window_cfg=window_cfg,
             target_mode=target_mode,
+            verbose=verbose,
         )
