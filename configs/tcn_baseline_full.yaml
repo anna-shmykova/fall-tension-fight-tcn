@@ -1,9 +1,9 @@
 exp:
-  name: tcn_causal_mlp_last_aggr_mlp_pool_motion_25_RWF_RLVS_erez_loss_alpha_window_16_exclude_tens
+  name: tcn_causal_mlp_last_aggr_pool_motion_25_ALL_DS_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:
-  data_root: /home/anna/TCN_TRAIN/datasets/dataset_RWF_erez  # change to your real json root
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v2  # change to your real json root
   runs_root: /home/anna/TCN_TRAIN/runs
 
 data:
@@ -20,7 +20,7 @@ data:
   kp_conf_keep: 0.3
 
   split:
-    mode: train_test_lists #"fixed" #"generate" codex resume 019d01bb-e3b5-7cb2-837a-6d40157793aa
+    mode: generate #"fixed" #"generate" codex resume 019d01bb-e3b5-7cb2-837a-6d40157793aa train_test_lists
     group_key: "video_id"
     seed: 42
     val_ratio: 0.2
@@ -52,16 +52,17 @@ model:
   mlp_out_dim: 32
   pool_mode: mean_max_std   # choices when attention is off: mean, max, mean_max, mean_max_std
   tcn_input_mode: pooled_count_motion   # choices: pooled_count, pooled_count_motion
+  use_person_count: true
   motion_proj_dim: 32
 
 train:
   batch_size: 32
-  epochs: 25
+  epochs: 20
   lr: 0.0005
   weight_decay: 0.0001
   pos_weight: 1.0
   grad_clip: 1.0
-  early_stop_patience: 7
+  early_stop_patience: 5
   num_workers: 0
   device: cuda
   agg_mode: last #logsumexp          # or logmeanexp (recommended) last

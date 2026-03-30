@@ -106,6 +106,7 @@ def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
         motion_dim=motion_dim,
         motion_proj_dim=int(motion_proj_dim) if motion_proj_dim is not None else None,
         tcn_input_mode=tcn_input_mode,
+        use_person_count=bool(model_cfg.get("use_person_count", True)),
     )
 
 

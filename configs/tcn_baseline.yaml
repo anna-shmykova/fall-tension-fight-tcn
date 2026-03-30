@@ -32,6 +32,7 @@ model:
   use_attention_readout: true
   pool_mode: mean_max_std
   tcn_input_mode: pooled_count
+  use_person_count: true
   motion_proj_dim: 32
 
 train:

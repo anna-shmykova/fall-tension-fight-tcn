@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from collections import deque
@@ -48,15 +49,19 @@ class GroundTruthSpec:
         if time_ms in self.gt_by_time_ms:
             return int(self.gt_by_time_ms[time_ms])
 
-        if self.source_kind == "txt":
-            for interval in self.intervals:
-                if interval["start_time_sec"] <= time_sec <= interval["end_time_sec"]:
-                    return int(interval["gt_label"])
-            return 0
+        for interval in self.intervals:
+            if interval["start_time_sec"] <= time_sec <= interval["end_time_sec"]:
+                return int(interval.get("gt_label", 1))
 
+        if self.source_kind:
+            return 0
         return None
 
-    def positive_intervals(self, fps: float) -> List[dict]:
+    def positive_intervals(
+        self,
+        fps: Optional[float] = None,
+        frame_time_records: Optional[List[Tuple[int, float]]] = None,
+    ) -> List[dict]:
         if self.source_kind == "txt":
             src_intervals = [interval for interval in self.intervals if int(interval.get("gt_label", 0)) == 1]
         else:
@@ -68,14 +73,24 @@ class GroundTruthSpec:
             end_time_sec = float(interval["end_time_sec"])
             start_frame = interval.get("start_frame")
             end_frame = interval.get("end_frame")
+
+            mapped_start_frame, mapped_end_frame = interval_time_to_frame_bounds(
+                start_time_sec,
+                end_time_sec,
+                frame_time_records=frame_time_records,
+            )
             if start_frame is None:
-                start_frame = int(round(start_time_sec * fps))
+                start_frame = mapped_start_frame
             if end_frame is None:
-                end_frame = int(round(end_time_sec * fps))
+                end_frame = mapped_end_frame
+            if start_frame is None and fps is not None:
+                start_frame = int(round(start_time_sec * float(fps)))
+            if end_frame is None and fps is not None:
+                end_frame = int(round(end_time_sec * float(fps)))
 
             item = {
-                "start_frame": int(start_frame),
-                "end_frame": int(end_frame),
+                "start_frame": int(start_frame) if start_frame is not None else None,
+                "end_frame": int(end_frame) if end_frame is not None else None,
                 "start_time_sec": start_time_sec,
                 "end_time_sec": end_time_sec,
             }
@@ -406,30 +421,62 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
         use_attention_readout = True if has_attn else False if model_cfg.get("use_attention_readout") is True else None
         mlp_out_dim = int(model_cfg.get("mlp_out_dim", 32))
         pool_mult = {"mean": 1, "max": 1, "mean_max": 2, "mean_max_std": 3, "attn": 1}
-        base_tcn_in = mlp_out_dim * pool_mult[pool_mode] + 1
+        base_scene_in = mlp_out_dim * pool_mult[pool_mode]
         actual_tcn_in = infer_tcn_in_channels_from_state_dict(state_dict)
 
         motion_proj_dim = None
         motion_dim = motion_feature_dim(feature_cfg)
         tcn_input_mode = str(model_cfg.get("tcn_input_mode", "pooled_count"))
+        use_person_count = bool(model_cfg.get("use_person_count", True))
 
-        if actual_tcn_in is not None and actual_tcn_in > base_tcn_in:
-            tcn_input_mode = "pooled_count_motion"
-            if "motion_proj.weight" in state_dict:
-                motion_dim = int(state_dict["motion_proj.weight"].shape[1])
-                motion_proj_dim = int(state_dict["motion_proj.weight"].shape[0])
+        if "motion_proj.weight" in state_dict:
+            motion_dim = int(state_dict["motion_proj.weight"].shape[1])
+            motion_proj_dim = int(state_dict["motion_proj.weight"].shape[0])
+
+        motion_out_dim = int(motion_proj_dim if motion_proj_dim is not None else (motion_dim if tcn_input_mode == "pooled_count_motion" else 0))
+
+        if actual_tcn_in is not None:
+            extra_tcn_in = int(actual_tcn_in - base_scene_in)
+            if extra_tcn_in < 0:
+                raise ValueError(f"Invalid EventTCN input width: base={base_scene_in} actual={actual_tcn_in}")
+
+            count_dim = int(extra_tcn_in - motion_out_dim)
+            if count_dim not in {0, 1}:
+                if motion_out_dim == 0 and extra_tcn_in > 1:
+                    motion_dim = int(extra_tcn_in - 1)
+                    motion_out_dim = motion_dim
+                    count_dim = 1
+                    tcn_input_mode = "pooled_count_motion"
+                else:
+                    raise ValueError(
+                        f"Could not infer use_person_count/motion layout from checkpoint: "
+                        f"base_scene_in={base_scene_in} actual_tcn_in={actual_tcn_in} motion_out_dim={motion_out_dim}"
+                    )
+
+            use_person_count = bool(count_dim == 1)
+            if motion_out_dim > 0:
+                tcn_input_mode = "pooled_count_motion"
+                motion_cfg = dict(feature_cfg.get("motion", {}))
+                motion_cfg["enabled"] = True
+                motion_cfg.setdefault("source", "erez")
+                motion_cfg.setdefault("align", "prev")
+                feature_cfg["motion"] = motion_cfg
             else:
-                motion_dim = int(actual_tcn_in - base_tcn_in)
+                motion_dim = 0
                 motion_proj_dim = None
-
-            motion_cfg = dict(feature_cfg.get("motion", {}))
-            motion_cfg["enabled"] = True
-            motion_cfg.setdefault("source", "erez")
-            motion_cfg.setdefault("align", "prev")
-            feature_cfg["motion"] = motion_cfg
+                tcn_input_mode = "pooled_count"
         else:
-            motion_dim = 0
-            tcn_input_mode = "pooled_count"
+            if motion_out_dim > 0:
+                tcn_input_mode = "pooled_count_motion"
+                motion_cfg = dict(feature_cfg.get("motion", {}))
+                motion_cfg["enabled"] = True
+                motion_cfg.setdefault("source", "erez")
+                motion_cfg.setdefault("align", "prev")
+                feature_cfg["motion"] = motion_cfg
+            else:
+                motion_dim = 0
+                motion_proj_dim = None
+                tcn_input_mode = "pooled_count"
 
         C = args.K * 40 + 1 + motion_dim
 
@@ -448,6 +495,7 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
             motion_dim=motion_dim,
             motion_proj_dim=motion_proj_dim,
             tcn_input_mode=tcn_input_mode,
+            use_person_count=use_person_count,
         )
 
     model.load_state_dict(state_dict, strict=True)
@@ -480,6 +528,7 @@ def load_ground_truth(gt_json: Optional[str], gt_txt: Optional[str], positive_ev
             gt_records.append({"frame": frame_id, "time_sec": time_sec, "gt_label": label})
 
         frame_dt_sec = estimate_time_step_sec(gt_records, default=1.0 / 25.0)
+        attach_record_spans(gt_records, default_span_sec=frame_dt_sec, default_span_frames=1)
         gt.intervals = build_intervals(gt_records, label_key="gt_label", span_frames=1, span_sec=frame_dt_sec)
         return gt
 
@@ -502,11 +551,19 @@ def build_intervals(
     end = None
 
     def close_interval(start_record: dict, end_record: dict) -> None:
+        end_frame = end_record.get("record_end_frame")
+        if end_frame is None and end_record.get("frame") is not None:
+            end_frame = int(end_record["frame"]) + int(span_frames)
+
+        end_time_sec = end_record.get("record_end_time_sec")
+        if end_time_sec is None:
+            end_time_sec = float(end_record["time_sec"]) + float(span_sec)
+
         interval = {
             "start_frame": int(start_record["frame"]) if start_record.get("frame") is not None else None,
-            "end_frame": int(end_record["frame"]) + int(span_frames) if end_record.get("frame") is not None else None,
+            "end_frame": int(end_frame) if end_frame is not None else None,
             "start_time_sec": float(start_record["time_sec"]),
-            "end_time_sec": float(end_record["time_sec"]) + float(span_sec),
+            "end_time_sec": float(end_time_sec),
         }
         if start_record.get("event_ids") or end_record.get("event_ids"):
             event_ids = sorted(set(start_record.get("event_ids", [])) | set(end_record.get("event_ids", [])))
@@ -547,6 +604,87 @@ def estimate_time_step_sec(records: List[dict], default: float = 0.0) -> float:
     if deltas:
         return float(np.median(np.asarray(deltas, dtype=np.float32)))
     return float(default)
+
+
+def resolve_frame_time_sec(
+    cap: cv2.VideoCapture,
+    frame_idx: int,
+    nominal_fps: float,
+    prev_time_sec: Optional[float] = None,
+    time_source: str = "auto",
+) -> Tuple[float, str]:
+    nominal_time_sec = float(frame_idx) / float(nominal_fps) if nominal_fps > 0 else 0.0
+    time_source = str(time_source).lower()
+
+    if time_source not in {"auto", "video", "nominal"}:
+        raise ValueError(f"Unsupported time_source: {time_source}")
+
+    if time_source in {"auto", "video"}:
+        pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if pos_msec is not None:
+            try:
+                video_time_sec = float(pos_msec) / 1000.0
+            except (TypeError, ValueError):
+                video_time_sec = None
+            if video_time_sec is not None and np.isfinite(video_time_sec) and video_time_sec >= 0.0:
+                if prev_time_sec is None or video_time_sec >= float(prev_time_sec) - 1e-3:
+                    return float(video_time_sec), "video"
+
+    if prev_time_sec is not None:
+        nominal_time_sec = max(float(nominal_time_sec), float(prev_time_sec))
+    return float(nominal_time_sec), "nominal"
+
+
+def interval_time_to_frame_bounds(
+    start_time_sec: float,
+    end_time_sec: float,
+    frame_time_records: Optional[List[Tuple[int, float]]] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    if not frame_time_records:
+        return None, None
+
+    frame_ids = np.asarray([int(frame_id) for frame_id, _ in frame_time_records], dtype=np.int64)
+    time_values = np.asarray([float(time_sec) for _, time_sec in frame_time_records], dtype=np.float64)
+    if time_values.size == 0:
+        return None, None
+
+    start_pos = int(np.searchsorted(time_values, float(start_time_sec), side="left"))
+    end_pos = int(np.searchsorted(time_values, float(end_time_sec), side="right") - 1)
+
+    start_pos = min(max(start_pos, 0), len(frame_ids) - 1)
+    end_pos = min(max(end_pos, 0), len(frame_ids) - 1)
+    if end_pos < start_pos:
+        end_pos = start_pos
+
+    return int(frame_ids[start_pos]), int(frame_ids[end_pos])
+
+
+def attach_record_spans(records: List[dict], default_span_sec: float = 0.0, default_span_frames: int = 0) -> None:
+    if not records:
+        return
+
+    default_span_sec = float(max(0.0, default_span_sec))
+    default_span_frames = int(max(0, default_span_frames))
+
+    for idx, record in enumerate(records):
+        next_record = records[idx + 1] if idx + 1 < len(records) else None
+
+        if next_record is not None and next_record.get("time_sec") is not None:
+            record_end_time_sec = float(next_record["time_sec"])
+        elif record.get("time_sec") is not None:
+            record_end_time_sec = float(record["time_sec"]) + default_span_sec
+        else:
+            record_end_time_sec = None
+
+        if next_record is not None and next_record.get("frame") is not None:
+            record_end_frame = int(next_record["frame"])
+        elif record.get("frame") is not None:
+            record_end_frame = int(record["frame"]) + default_span_frames
+        else:
+            record_end_frame = None
+
+        record["record_end_time_sec"] = record_end_time_sec
+        record["record_end_frame"] = record_end_frame
 
 
 def interval_duration_sec(interval: dict) -> float:
@@ -718,15 +856,20 @@ def compute_event_stats(
     }
 
 
-def compute_binary_stats(records: List[dict]) -> dict:
-    eval_records = [record for record in records if record.get("gt_label") is not None]
+def compute_binary_stats(
+    records: List[dict],
+    label_key: str = "gt_label",
+    pred_key: str = "pred_state",
+    count_key: str = "n_eval_frames",
+) -> dict:
+    eval_records = [record for record in records if record.get(label_key) is not None and record.get(pred_key) is not None]
     if not eval_records:
-        return {"n_eval_frames": 0}
+        return {count_key: 0}
 
     tp = fp = tn = fn = 0
     for record in eval_records:
-        pred = int(bool(record["pred_state"]))
-        gt = int(record["gt_label"])
+        pred = int(bool(record[pred_key]))
+        gt = int(record[label_key])
         if pred == 1 and gt == 1:
             tp += 1
         elif pred == 1 and gt == 0:
@@ -742,7 +885,7 @@ def compute_binary_stats(records: List[dict]) -> dict:
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
     return {
-        "n_eval_frames": len(eval_records),
+        count_key: len(eval_records),
         "tp": tp,
         "fp": fp,
         "tn": tn,
@@ -754,12 +897,17 @@ def compute_binary_stats(records: List[dict]) -> dict:
     }
 
 
-def compute_probability_stats(records: List[dict], prob_key: str) -> dict:
-    eval_records = [record for record in records if record.get("gt_label") is not None and record.get(prob_key) is not None]
+def compute_probability_stats(
+    records: List[dict],
+    prob_key: str,
+    label_key: str = "gt_label",
+    count_key: str = "n_eval_frames",
+) -> dict:
+    eval_records = [record for record in records if record.get(label_key) is not None and record.get(prob_key) is not None]
     if not eval_records:
-        return {"n_eval_frames": 0}
+        return {count_key: 0}
 
-    y_true = np.asarray([int(record["gt_label"]) for record in eval_records], dtype=np.int32)
+    y_true = np.asarray([int(record[label_key]) for record in eval_records], dtype=np.int32)
     y_prob = np.asarray([float(record[prob_key]) for record in eval_records], dtype=np.float32)
 
     pos_mask = y_true == 1
@@ -768,7 +916,7 @@ def compute_probability_stats(records: List[dict], prob_key: str) -> dict:
     best = max(sweep, key=lambda row: row["f1"])
 
     return {
-        "n_eval_frames": int(len(eval_records)),
+        count_key: int(len(eval_records)),
         "auprc": compute_auprc(y_true, y_prob),
         "auroc": compute_auroc(y_true, y_prob),
         "mean_prob_pos": float(np.mean(y_prob[pos_mask])) if np.any(pos_mask) else None,
@@ -782,6 +930,165 @@ def compute_probability_stats(records: List[dict], prob_key: str) -> dict:
         },
         "threshold_sweep": sweep,
     }
+
+
+def resolve_window_target_mode(cfg: dict, requested_mode: str) -> str:
+    requested_mode = str(requested_mode).lower()
+    if requested_mode != "auto":
+        if requested_mode not in {"last", "center"}:
+            raise ValueError(f"Unsupported window_target_mode: {requested_mode}")
+        return requested_mode
+
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    target_mode = str(
+        data_cfg.get(
+            "target_mode",
+            "last" if bool(model_cfg.get("causal", True)) else "center",
+        )
+    ).lower()
+    if target_mode not in {"last", "center"}:
+        raise ValueError(f"Unsupported resolved window target mode: {target_mode}")
+    return target_mode
+
+
+def total_interval_overlap_sec(start_time_sec: float, end_time_sec: float, intervals: List[dict]) -> float:
+    if end_time_sec < start_time_sec:
+        end_time_sec = start_time_sec
+
+    probe = {
+        "start_time_sec": float(start_time_sec),
+        "end_time_sec": float(end_time_sec),
+    }
+    overlap_sec = 0.0
+    for interval in intervals:
+        overlap_sec += interval_overlap_sec(probe, interval)
+    return float(overlap_sec)
+
+
+def annotate_window_labels(
+    records: List[dict],
+    gt: GroundTruthSpec,
+    gt_positive_intervals: List[dict],
+    label_rule: str,
+    target_mode: str,
+    positive_overlap_fraction: float,
+) -> dict:
+    label_rule = str(label_rule).lower()
+    target_mode = str(target_mode).lower()
+    positive_overlap_fraction = float(max(0.0, positive_overlap_fraction))
+
+    summary = {
+        "label_rule": label_rule,
+        "target_mode": target_mode,
+        "positive_overlap_fraction": positive_overlap_fraction,
+        "n_candidate_windows": int(len(records)),
+        "n_eval_windows": 0,
+        "n_positive_windows": 0,
+        "n_negative_windows": 0,
+        "n_skipped_windows": 0,
+    }
+    if label_rule == "off" or not gt.source_kind:
+        return summary
+
+    for record in records:
+        window_start_time_sec = float(record.get("window_start_time_sec", record.get("time_sec", 0.0)))
+        window_end_time_sec = float(record.get("window_end_time_sec", record.get("time_sec", window_start_time_sec)))
+        if window_end_time_sec < window_start_time_sec:
+            window_end_time_sec = window_start_time_sec
+
+        window_start_frame = record.get("window_start_frame")
+        window_end_frame = record.get("window_end_frame", record.get("frame"))
+        if window_start_frame is not None:
+            window_start_frame = int(window_start_frame)
+        if window_end_frame is not None:
+            window_end_frame = int(window_end_frame)
+
+        if target_mode == "center":
+            target_time_sec = 0.5 * (window_start_time_sec + window_end_time_sec)
+            if window_start_frame is not None and window_end_frame is not None:
+                target_frame = int(round(0.5 * (window_start_frame + window_end_frame)))
+            else:
+                target_frame = window_end_frame if window_end_frame is not None else window_start_frame
+        else:
+            target_time_sec = float(record.get("time_sec", window_end_time_sec))
+            target_frame = int(record["frame"]) if record.get("frame") is not None else window_end_frame
+
+        overlap_sec = total_interval_overlap_sec(window_start_time_sec, window_end_time_sec, gt_positive_intervals)
+        window_duration_sec = max(0.0, window_end_time_sec - window_start_time_sec)
+        overlap_fraction = float(overlap_sec / window_duration_sec) if window_duration_sec > 0 else float(overlap_sec > 0.0)
+        target_label = gt.label_for(target_frame if target_frame is not None else -1, target_time_sec)
+
+        if label_rule == "target":
+            label = target_label
+        elif label_rule == "train_like":
+            if target_label == 1:
+                label = 1
+            elif overlap_sec <= 0.0:
+                label = 0
+            else:
+                label = None
+        elif label_rule == "any_overlap":
+            label = int(overlap_sec > 0.0)
+        elif label_rule == "overlap_frac":
+            label = int(overlap_fraction >= positive_overlap_fraction)
+        else:
+            raise ValueError(f"Unsupported window_eval_label_rule: {label_rule}")
+
+        record["window_target_frame"] = target_frame
+        record["window_target_time_sec"] = float(target_time_sec)
+        record["window_positive_overlap_sec"] = float(overlap_sec)
+        record["window_positive_overlap_frac"] = float(overlap_fraction)
+        record["gt_window_target_label"] = target_label
+        record["gt_window_label"] = label
+
+        if label is None:
+            summary["n_skipped_windows"] += 1
+        elif int(label) == 1:
+            summary["n_eval_windows"] += 1
+            summary["n_positive_windows"] += 1
+        else:
+            summary["n_eval_windows"] += 1
+            summary["n_negative_windows"] += 1
+
+    return summary
+
+
+def write_debug_records_csv(debug_path: Path, records: List[dict]) -> None:
+    base_fields = [
+        "frame",
+        "time_sec",
+        "resolved_time_source",
+        "window_start_frame",
+        "window_end_frame",
+        "window_start_time_sec",
+        "window_end_time_sec",
+        "window_target_frame",
+        "window_target_time_sec",
+        "prob",
+        "prob_smooth",
+        "state_score",
+        "pred_state",
+        "gt_label",
+        "gt_window_target_label",
+        "gt_window_label",
+        "window_positive_overlap_sec",
+        "window_positive_overlap_frac",
+        "det_count",
+        "count_norm",
+    ]
+    max_motion_dim = max((len(record.get("motion_features") or []) for record in records), default=0)
+    fieldnames = base_fields + [f"motion_{idx + 1:02d}" for idx in range(max_motion_dim)]
+
+    with debug_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            row = {field: record.get(field) for field in base_fields}
+            motion_features = list(record.get("motion_features") or [])
+            for idx in range(max_motion_dim):
+                row[f"motion_{idx + 1:02d}"] = motion_features[idx] if idx < len(motion_features) else ""
+            writer.writerow(row)
 
 
 def write_events_report(events_path: Path, predicted_events: List[dict], gt_events: List[dict], stats: dict) -> None:
@@ -800,7 +1107,7 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
         if not summary:
             return
         lines.append(title)
-        for key in ("n_eval_frames", "precision", "recall", "f1", "accuracy", "auprc", "auroc", "mean_prob_pos", "mean_prob_neg"):
+        for key in ("n_eval_frames", "n_eval_windows", "precision", "recall", "f1", "accuracy", "auprc", "auroc", "mean_prob_pos", "mean_prob_neg"):
             if key not in summary:
                 continue
             value = summary[key]
@@ -890,14 +1197,49 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
             lines.append("Unmatched predicted events:")
             lines.append(", ".join(f"Pred#{idx}" for idx in unmatched_pred))
 
+    window_eval = stats.get("window_eval", {})
+    if window_eval:
+        lines.append("")
+        lines.append("Window-level evaluation:")
+        for key in (
+            "label_rule",
+            "target_mode",
+            "positive_overlap_fraction",
+            "n_candidate_windows",
+            "n_eval_windows",
+            "n_positive_windows",
+            "n_negative_windows",
+            "n_skipped_windows",
+        ):
+            if key not in window_eval:
+                continue
+            value = window_eval[key]
+            if isinstance(value, float):
+                lines.append(f"{key}: {value:.4f}")
+            else:
+                lines.append(f"{key}: {value}")
+
+        lines.append("")
+        append_stats_block(lines, "Windowed state:", stats.get("window_state_stats", {}))
+        lines.append("")
+        append_stats_block(lines, "Windowed raw probability:", stats.get("window_prob_raw_stats", {}))
+        lines.append("")
+        append_stats_block(lines, "Windowed processed probability:", stats.get("window_prob_smooth_stats", {}))
+
     lines.append("")
     lines.append("Inference settings:")
     lines.append(f"state_method: {stats.get('state_method')}")
     lines.append(f"state_source: {stats.get('state_source')}")
     lines.append(f"smooth_mode: {stats.get('smooth_mode')}")
+    lines.append(f"time_source: {stats.get('time_source', 'nominal')}")
+    if stats.get('nominal_fps') is not None:
+        lines.append(f"nominal_fps: {float(stats.get('nominal_fps')):.4f}")
     lines.append(f"merge_gap_sec: {float(stats.get('merge_gap_sec', 0.0)):.2f}")
     lines.append(f"min_event_sec: {float(stats.get('min_event_sec', 0.0)):.2f}")
     lines.append(f"min_match_overlap_sec: {float(stats.get('min_match_overlap_sec', 0.0)):.2f}")
+    lines.append(f"window_eval_label_rule: {stats.get('window_eval_label_rule', 'off')}")
+    lines.append(f"window_target_mode: {stats.get('window_target_mode', 'last')}")
+    lines.append(f"window_positive_overlap: {float(stats.get('window_positive_overlap', 0.0)):.2f}")
     lines.append(f"n_predicted_events_raw: {stats.get('n_predicted_events_raw', 0)}")
     lines.append(f"n_gt_events_raw: {stats.get('n_gt_events_raw', 0)}")
 
@@ -965,10 +1307,12 @@ def main():
     ap.add_argument("--gt_positive_event_id", type=int, default=4, help="Event id from GT annotations to treat as the positive class.")
     ap.add_argument("--events_txt", default=None, help="Optional sidecar text file with predicted/GT events.")
     ap.add_argument("--stats_json", default=None, help="Optional sidecar JSON with inference-vs-GT statistics.")
+    ap.add_argument("--debug_csv", default=None, help="Optional sidecar CSV with one row per inference step, including scores, counts, and motion features.")
 
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--step", type=int, default=5)
     ap.add_argument("--conf", type=float, default=0.5)
+    ap.add_argument("--time_source", choices=["auto", "video", "nominal"], default="auto", help="How to assign timestamps to decoded frames. 'auto' prefers per-frame video timestamps and falls back to nominal fps.")
 
     ap.add_argument("--K", type=int, default=25)
     ap.add_argument("--win", type=int, default=16)
@@ -987,6 +1331,9 @@ def main():
     ap.add_argument("--merge_gap_sec", type=float, default=0.0, help="Merge predicted and GT intervals separated by at most this gap for incident-level evaluation.")
     ap.add_argument("--min_event_sec", type=float, default=0.0, help="Drop predicted events shorter than this duration after merging.")
     ap.add_argument("--min_match_overlap_sec", type=float, default=0.0, help="Minimum overlap required to match a predicted incident to a GT incident.")
+    ap.add_argument("--window_eval_label_rule", choices=["off", "train_like", "target", "any_overlap", "overlap_frac"], default="train_like", help="How to assign GT labels to inference windows. 'train_like' matches the training/test dataset logic by skipping mixed target-negative windows.")
+    ap.add_argument("--window_target_mode", choices=["auto", "last", "center"], default="auto", help="Target position used for window labeling when --window_eval_label_rule depends on a target frame.")
+    ap.add_argument("--window_positive_overlap", type=float, default=0.3, help="Positive-overlap fraction threshold when --window_eval_label_rule=overlap_frac.")
 
     args = ap.parse_args()
 
@@ -1009,6 +1356,7 @@ def main():
         raise RuntimeError(f"Cannot open video: {args.video_in}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    nominal_fps = float(fps)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -1019,11 +1367,16 @@ def main():
 
     events_path = Path(args.events_txt).resolve() if args.events_txt else out_path.with_suffix(".events.txt")
     stats_path = Path(args.stats_json).resolve() if args.stats_json else out_path.with_suffix(".stats.json")
+    debug_path = Path(args.debug_csv).resolve() if args.debug_csv else out_path.with_suffix(".debug.csv")
     events_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
 
     records: List[dict] = []
+    frame_time_records: List[Tuple[int, float]] = []
+    frame_time_source_counts: Dict[str, int] = {"video": 0, "nominal": 0}
     vec_buf: Deque[np.ndarray] = deque(maxlen=args.win)
+    sample_meta_buf: Deque[Dict[str, float]] = deque(maxlen=args.win)
     prev_sample_frame: Optional[Dict[str, object]] = None
     next_infer_idx = args.win - 1
     sample_idx = -1
@@ -1037,16 +1390,27 @@ def main():
     smooth_buf: Deque[float] = deque(maxlen=max(int(args.mean_window), 1))
 
     frame_idx = -1
+    last_frame_time_sec: Optional[float] = None
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frame_idx += 1
+        frame_time_sec, resolved_time_source = resolve_frame_time_sec(
+            cap,
+            frame_idx=frame_idx,
+            nominal_fps=nominal_fps,
+            prev_time_sec=last_frame_time_sec,
+            time_source=str(args.time_source),
+        )
+        last_frame_time_sec = float(frame_time_sec)
+        frame_time_records.append((frame_idx, float(frame_time_sec)))
+        frame_time_source_counts[resolved_time_source] = frame_time_source_counts.get(resolved_time_source, 0) + 1
         did_infer = False
 
         if frame_idx % args.step == 0:
             sample_idx += 1
-            sample_t = frame_idx / fps
+            sample_t = float(frame_time_sec)
             n_H = H if H % 32 == 0 else H + (32 - (H%32))
             n_W = W if W % 32 == 0 else W + (32 - (W%32))
             r = yolo(frame, conf=args.conf, verbose=False, imgsz=(n_H, n_W))[0]
@@ -1057,6 +1421,9 @@ def main():
                 "group_events": [],
                 "detection_list": det_list,
             }
+            det_count = int(len(det_list))
+            count_norm = float(min(det_count, int(args.K)) / max(int(args.K), 1))
+            current_motion_vec: Optional[np.ndarray] = None
 
             if model_type in MOTION_ONLY_MODEL_TYPES:
                 if prev_sample_frame is not None:
@@ -1066,7 +1433,9 @@ def main():
                         j_version=feature_cfg.get("erez_json_version", 2.0),
                     )[-1]
                     motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
-                    vec_buf.append(motion_vec.astype(np.float32))
+                    current_motion_vec = motion_vec.astype(np.float32, copy=False)
+                    vec_buf.append(current_motion_vec)
+                    sample_meta_buf.append({"frame": int(frame_idx), "time_sec": float(sample_t)})
                     motion_idx += 1
 
                     if len(vec_buf) == args.win and motion_idx >= next_infer_idx:
@@ -1105,9 +1474,11 @@ def main():
                             j_version=feature_cfg.get("erez_json_version", 2.0),
                         )[-1]
                         motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
-                    x_t = np.concatenate([x_t, motion_vec], axis=0).astype(np.float32)
+                    current_motion_vec = motion_vec.astype(np.float32, copy=False)
+                    x_t = np.concatenate([x_t, current_motion_vec], axis=0).astype(np.float32)
 
                 vec_buf.append(x_t)
+                sample_meta_buf.append({"frame": int(frame_idx), "time_sec": float(sample_t)})
                 prev_sample_frame = frame_payload
 
                 if len(vec_buf) == args.win and sample_idx >= next_infer_idx:
@@ -1135,19 +1506,27 @@ def main():
 
             if did_infer:
                 gt_label = gt.label_for(frame_idx, sample_t)
+                window_start_meta = sample_meta_buf[0] if sample_meta_buf else {"frame": frame_idx, "time_sec": sample_t}
                 records.append(
                     {
                         "frame": frame_idx,
                         "time_sec": sample_t,
+                        "resolved_time_source": resolved_time_source,
+                        "window_start_frame": int(window_start_meta.get("frame", frame_idx)),
+                        "window_end_frame": int(frame_idx),
+                        "window_start_time_sec": float(window_start_meta.get("time_sec", sample_t)),
+                        "window_end_time_sec": float(sample_t),
                         "prob": last_p,
                         "prob_smooth": p_smooth,
                         "state_score": state_score,
                         "pred_state": int(last_state),
                         "gt_label": gt_label,
+                        "det_count": det_count,
+                        "count_norm": count_norm,
+                        "motion_features": (current_motion_vec.tolist() if current_motion_vec is not None else []),
                     }
                 )
 
-        frame_time_sec = frame_idx / fps
         gt_now = gt.label_for(frame_idx, frame_time_sec)
         txt1 = f"p={last_p:.3f} ps={p_smooth:.3f} ss={state_score:.3f}" if last_p is not None and p_smooth is not None and state_score is not None else "p=..."
         txt2 = "ABNORMAL=ON" if last_state else "ABNORMAL=OFF"
@@ -1173,8 +1552,9 @@ def main():
     cap.release()
     outv.release()
 
-    infer_dt_sec = float(args.step * args.stride) / float(fps) if fps > 0 else 0.0
+    infer_dt_sec = estimate_time_step_sec(records, default=(float(args.step * args.stride) / float(nominal_fps) if nominal_fps > 0 else 0.0))
     infer_span_frames = max(int(args.step * args.stride), 1)
+    attach_record_spans(records, default_span_sec=infer_dt_sec, default_span_frames=infer_span_frames)
     predicted_events_raw = build_intervals(
         records,
         label_key="pred_state",
@@ -1186,17 +1566,29 @@ def main():
         merge_gap_sec=float(args.merge_gap_sec),
         min_duration_sec=float(args.min_event_sec),
     )
-    gt_events_raw = gt.positive_intervals(fps=fps)
+    gt_events_raw = gt.positive_intervals(fps=nominal_fps, frame_time_records=frame_time_records)
     gt_events = postprocess_intervals(
         gt_events_raw,
         merge_gap_sec=float(args.merge_gap_sec),
         min_duration_sec=0.0,
     )
+    window_target_mode = resolve_window_target_mode(cfg, args.window_target_mode)
+    window_eval = annotate_window_labels(
+        records,
+        gt=gt,
+        gt_positive_intervals=postprocess_intervals(gt_events_raw, merge_gap_sec=0.0, min_duration_sec=0.0),
+        label_rule=str(args.window_eval_label_rule),
+        target_mode=window_target_mode,
+        positive_overlap_fraction=float(args.window_positive_overlap),
+    )
 
     hyst_stats = compute_binary_stats(records)
     prob_raw_stats = compute_probability_stats(records, prob_key="prob")
     prob_smooth_stats = compute_probability_stats(records, prob_key="prob_smooth")
-    video_duration_sec = float((frame_idx + 1) / fps) if frame_idx >= 0 and fps > 0 else 0.0
+    window_state_stats = compute_binary_stats(records, label_key="gt_window_label", pred_key="pred_state", count_key="n_eval_windows")
+    window_prob_raw_stats = compute_probability_stats(records, prob_key="prob", label_key="gt_window_label", count_key="n_eval_windows")
+    window_prob_smooth_stats = compute_probability_stats(records, prob_key="prob_smooth", label_key="gt_window_label", count_key="n_eval_windows")
+    video_duration_sec = float(last_frame_time_sec) if last_frame_time_sec is not None else (float((frame_idx + 1) / nominal_fps) if frame_idx >= 0 and nominal_fps > 0 else 0.0)
     event_stats = {}
     if gt.source_kind:
         event_stats = compute_event_stats(
@@ -1223,9 +1615,17 @@ def main():
             "state_source": str(args.state_source),
             "smooth_mode": str(args.smooth_mode),
             "state_threshold": float(args.thr_on),
+            "time_source": str(args.time_source),
+            "resolved_time_sources": dict(frame_time_source_counts),
+            "nominal_fps": float(nominal_fps),
+            "video_duration_sec": float(video_duration_sec),
+            "debug_csv": str(debug_path),
             "merge_gap_sec": float(args.merge_gap_sec),
             "min_event_sec": float(args.min_event_sec),
             "min_match_overlap_sec": float(args.min_match_overlap_sec),
+            "window_eval_label_rule": str(args.window_eval_label_rule),
+            "window_target_mode": str(window_target_mode),
+            "window_positive_overlap": float(args.window_positive_overlap),
             "inference_dt_sec": float(infer_dt_sec),
             "n_predictions": len(records),
             "n_predicted_events_raw": len(predicted_events_raw),
@@ -1235,11 +1635,16 @@ def main():
             "hysteresis_stats": hyst_stats,
             "prob_raw_stats": prob_raw_stats,
             "prob_smooth_stats": prob_smooth_stats,
+            "window_eval": window_eval,
+            "window_state_stats": window_state_stats,
+            "window_prob_raw_stats": window_prob_raw_stats,
+            "window_prob_smooth_stats": window_prob_smooth_stats,
             "event_stats": event_stats,
         }
     )
 
     write_events_report(events_path, predicted_events, gt_events, stats)
+    write_debug_records_csv(debug_path, records)
     stats_path.write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
 
     print(f"[DONE] wrote video:  {out_path}")

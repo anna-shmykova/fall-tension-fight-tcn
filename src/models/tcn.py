@@ -97,11 +97,13 @@ class EventTCN(nn.Module):
                     motion_dim=0,
                     motion_proj_dim=None,
                     tcn_input_mode="pooled_count",
+                    use_person_count=True,
                 ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.motion_dim = int(motion_dim)
         self.tcn_input_mode = str(tcn_input_mode)
+        self.use_person_count = bool(use_person_count)
         self.use_graph = bool(use_graph)
         self.pool_mode = resolve_pool_mode(pool_mode=pool_mode, use_attention_readout=use_attention_readout)
 
@@ -150,7 +152,8 @@ class EventTCN(nn.Module):
             self.motion_proj = None
             motion_out_dim = 0
 
-        in_ch = mlp_out_dim * pool_mult[self.pool_mode] + 1 + (motion_out_dim if use_motion else 0)
+        count_dim = 1 if self.use_person_count else 0
+        in_ch = mlp_out_dim * pool_mult[self.pool_mode] + count_dim + (motion_out_dim if use_motion else 0)
 
         layers = []
         dilation = 1
@@ -184,10 +187,12 @@ class EventTCN(nn.Module):
         if self.graph is not None:
             emb = self.graph(emb, person_bboxes, person_mask)   # (B,T,N,E)
         scene, _ = self.pool(emb, mask=person_mask, return_attn=True)
-        count = person_mask.sum(dim=2).float()                  # (B,T)
-        count_norm = count / person_mask.size(2)                # (B,T)
+        tcn_inputs = [scene]
+        if self.use_person_count:
+            count = person_mask.sum(dim=2).float()                  # (B,T)
+            count_norm = count / person_mask.size(2)                # (B,T)
+            tcn_inputs.append(count_norm.unsqueeze(-1))
 
-        tcn_inputs = [scene, count_norm.unsqueeze(-1)]
         if self.tcn_input_mode == "pooled_count_motion":
             if motion is None or self.motion_proj is None:
                 raise ValueError("Motion features are enabled in the model but missing at runtime")
