@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_mlp_last_aggr_mlp_pool_motion_RWF_RVLS_erez_loss_alpha_window_16_exclude_tens
+  name: tcn_causal_mlp_last_aggr_mlp_pool_motion_25_RWF_RLVS_erez_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:

@@ -473,12 +473,14 @@ def load_ground_truth(gt_json: Optional[str], gt_txt: Optional[str], positive_ev
             frame_id = int(frame.get("f", idx))
             time_sec = float(frame.get("t", frame_id / 25.0))
             time_ms = int(round(time_sec * 1000))
-            label = int(events_to_label(frame))
+            group_events = frame.get("group_events", []) or []
+            label = int(int(positive_event_id) in group_events)
             gt.gt_by_frame[frame_id] = label
             gt.gt_by_time_ms[time_ms] = label
             gt_records.append({"frame": frame_id, "time_sec": time_sec, "gt_label": label})
 
-        gt.intervals = build_intervals(gt_records, label_key="gt_label")
+        frame_dt_sec = estimate_time_step_sec(gt_records, default=1.0 / 25.0)
+        gt.intervals = build_intervals(gt_records, label_key="gt_label", span_frames=1, span_sec=frame_dt_sec)
         return gt
 
     if gt_txt:
@@ -489,10 +491,28 @@ def load_ground_truth(gt_json: Optional[str], gt_txt: Optional[str], positive_ev
     return gt
 
 
-def build_intervals(records: List[dict], label_key: str) -> List[dict]:
+def build_intervals(
+    records: List[dict],
+    label_key: str,
+    span_frames: int = 0,
+    span_sec: float = 0.0,
+) -> List[dict]:
     intervals = []
     start = None
     end = None
+
+    def close_interval(start_record: dict, end_record: dict) -> None:
+        interval = {
+            "start_frame": int(start_record["frame"]) if start_record.get("frame") is not None else None,
+            "end_frame": int(end_record["frame"]) + int(span_frames) if end_record.get("frame") is not None else None,
+            "start_time_sec": float(start_record["time_sec"]),
+            "end_time_sec": float(end_record["time_sec"]) + float(span_sec),
+        }
+        if start_record.get("event_ids") or end_record.get("event_ids"):
+            event_ids = sorted(set(start_record.get("event_ids", [])) | set(end_record.get("event_ids", [])))
+            if event_ids:
+                interval["event_ids"] = event_ids
+        intervals.append(interval)
 
     for record in records:
         is_pos = bool(record.get(label_key, 0))
@@ -501,28 +521,201 @@ def build_intervals(records: List[dict], label_key: str) -> List[dict]:
                 start = record
             end = record
         elif start is not None and end is not None:
-            intervals.append(
-                {
-                    "start_frame": int(start["frame"]),
-                    "end_frame": int(end["frame"]),
-                    "start_time_sec": float(start["time_sec"]),
-                    "end_time_sec": float(end["time_sec"]),
-                }
-            )
+            close_interval(start, end)
             start = None
             end = None
 
     if start is not None and end is not None:
-        intervals.append(
-            {
-                "start_frame": int(start["frame"]),
-                "end_frame": int(end["frame"]),
-                "start_time_sec": float(start["time_sec"]),
-                "end_time_sec": float(end["time_sec"]),
-            }
-        )
+        close_interval(start, end)
 
     return intervals
+
+
+def estimate_time_step_sec(records: List[dict], default: float = 0.0) -> float:
+    deltas = []
+    prev_t = None
+    for record in records:
+        time_sec = record.get("time_sec")
+        if time_sec is None:
+            continue
+        time_sec = float(time_sec)
+        if prev_t is not None:
+            dt = time_sec - prev_t
+            if dt > 0:
+                deltas.append(dt)
+        prev_t = time_sec
+    if deltas:
+        return float(np.median(np.asarray(deltas, dtype=np.float32)))
+    return float(default)
+
+
+def interval_duration_sec(interval: dict) -> float:
+    return max(0.0, float(interval["end_time_sec"]) - float(interval["start_time_sec"]))
+
+
+def interval_overlap_sec(a: dict, b: dict) -> float:
+    return max(0.0, min(float(a["end_time_sec"]), float(b["end_time_sec"])) - max(float(a["start_time_sec"]), float(b["start_time_sec"])))
+
+
+def interval_iou(a: dict, b: dict) -> float:
+    overlap = interval_overlap_sec(a, b)
+    if overlap <= 0.0:
+        return 0.0
+    union = interval_duration_sec(a) + interval_duration_sec(b) - overlap
+    if union <= 0.0:
+        return 0.0
+    return float(overlap / union)
+
+
+def postprocess_intervals(intervals: List[dict], merge_gap_sec: float = 0.0, min_duration_sec: float = 0.0) -> List[dict]:
+    if not intervals:
+        return []
+
+    merge_gap_sec = float(max(0.0, merge_gap_sec))
+    min_duration_sec = float(max(0.0, min_duration_sec))
+
+    intervals_sorted = [dict(interval) for interval in sorted(intervals, key=lambda item: (float(item["start_time_sec"]), float(item["end_time_sec"]))) ]
+    merged: List[dict] = []
+
+    for interval in intervals_sorted:
+        interval.setdefault("parts", 1)
+        if not merged:
+            merged.append(interval)
+            continue
+
+        prev = merged[-1]
+        gap_sec = float(interval["start_time_sec"]) - float(prev["end_time_sec"])
+        if gap_sec <= merge_gap_sec:
+            prev["end_time_sec"] = max(float(prev["end_time_sec"]), float(interval["end_time_sec"]))
+            if prev.get("start_frame") is not None and interval.get("start_frame") is not None:
+                prev["start_frame"] = min(int(prev["start_frame"]), int(interval["start_frame"]))
+            if interval.get("end_frame") is not None:
+                if prev.get("end_frame") is None:
+                    prev["end_frame"] = int(interval["end_frame"])
+                else:
+                    prev["end_frame"] = max(int(prev["end_frame"]), int(interval["end_frame"]))
+            event_ids = sorted(set(prev.get("event_ids", [])) | set(interval.get("event_ids", [])))
+            if event_ids:
+                prev["event_ids"] = event_ids
+            prev["parts"] = int(prev.get("parts", 1)) + int(interval.get("parts", 1))
+        else:
+            merged.append(interval)
+
+    if min_duration_sec <= 0.0:
+        return merged
+    return [interval for interval in merged if interval_duration_sec(interval) >= min_duration_sec]
+
+
+def match_event_intervals(
+    predicted_events: List[dict],
+    gt_events: List[dict],
+    min_overlap_sec: float = 0.0,
+) -> Tuple[List[dict], List[int], List[int]]:
+    candidates = []
+    min_overlap_sec = float(max(0.0, min_overlap_sec))
+
+    for gt_idx, gt_event in enumerate(gt_events):
+        for pred_idx, pred_event in enumerate(predicted_events):
+            overlap = interval_overlap_sec(pred_event, gt_event)
+            if overlap <= min_overlap_sec:
+                continue
+
+            gt_duration = max(interval_duration_sec(gt_event), 1e-12)
+            pred_duration = max(interval_duration_sec(pred_event), 1e-12)
+            onset_delay_sec = float(pred_event["start_time_sec"]) - float(gt_event["start_time_sec"])
+            match = {
+                "gt_index": int(gt_idx + 1),
+                "pred_index": int(pred_idx + 1),
+                "overlap_sec": float(overlap),
+                "iou": float(interval_iou(pred_event, gt_event)),
+                "gt_coverage": float(overlap / gt_duration),
+                "pred_coverage": float(overlap / pred_duration),
+                "onset_delay_sec": float(onset_delay_sec),
+                "detection_delay_sec": float(max(0.0, onset_delay_sec)),
+                "offset_error_sec": float(pred_event["end_time_sec"] - gt_event["end_time_sec"]),
+            }
+            candidates.append((match["overlap_sec"], match["gt_coverage"], match["iou"], -abs(match["onset_delay_sec"]), gt_idx, pred_idx, match))
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+
+    matched_gt = set()
+    matched_pred = set()
+    matches: List[dict] = []
+
+    for _, _, _, _, gt_idx, pred_idx, match in candidates:
+        if gt_idx in matched_gt or pred_idx in matched_pred:
+            continue
+        matched_gt.add(gt_idx)
+        matched_pred.add(pred_idx)
+        matches.append(match)
+
+    matches.sort(key=lambda item: (item["gt_index"], item["pred_index"]))
+    unmatched_gt = [idx + 1 for idx in range(len(gt_events)) if idx not in matched_gt]
+    unmatched_pred = [idx + 1 for idx in range(len(predicted_events)) if idx not in matched_pred]
+    return matches, unmatched_gt, unmatched_pred
+
+
+def compute_event_stats(
+    predicted_events: List[dict],
+    gt_events: List[dict],
+    video_duration_sec: float,
+    min_overlap_sec: float = 0.0,
+) -> dict:
+    matches, unmatched_gt, unmatched_pred = match_event_intervals(
+        predicted_events,
+        gt_events,
+        min_overlap_sec=min_overlap_sec,
+    )
+
+    tp = len(matches)
+    fp = len(unmatched_pred)
+    fn = len(unmatched_gt)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    def _mean_or_none(values: List[float]):
+        return float(np.mean(np.asarray(values, dtype=np.float32))) if values else None
+
+    def _median_or_none(values: List[float]):
+        return float(np.median(np.asarray(values, dtype=np.float32))) if values else None
+
+    ious = [float(match["iou"]) for match in matches]
+    gt_coverages = [float(match["gt_coverage"]) for match in matches]
+    onset_delays = [float(match["onset_delay_sec"]) for match in matches]
+    detection_delays = [float(match["detection_delay_sec"]) for match in matches]
+    offset_errors = [float(match["offset_error_sec"]) for match in matches]
+
+    false_alarms_per_min = None
+    if video_duration_sec > 0:
+        false_alarms_per_min = float(fp / (video_duration_sec / 60.0))
+
+    return {
+        "n_predicted_events": int(len(predicted_events)),
+        "n_gt_events": int(len(gt_events)),
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "false_alarms_per_min": false_alarms_per_min,
+        "mean_iou": _mean_or_none(ious),
+        "median_iou": _median_or_none(ious),
+        "mean_gt_coverage": _mean_or_none(gt_coverages),
+        "median_gt_coverage": _median_or_none(gt_coverages),
+        "mean_onset_delay_sec": _mean_or_none(onset_delays),
+        "median_onset_delay_sec": _median_or_none(onset_delays),
+        "mean_detection_delay_sec": _mean_or_none(detection_delays),
+        "median_detection_delay_sec": _median_or_none(detection_delays),
+        "mean_offset_error_sec": _mean_or_none(offset_errors),
+        "median_offset_error_sec": _median_or_none(offset_errors),
+        "matches": matches,
+        "unmatched_gt_indices": unmatched_gt,
+        "unmatched_pred_indices": unmatched_pred,
+        "min_match_overlap_sec": float(min_overlap_sec),
+    }
 
 
 def compute_binary_stats(records: List[dict]) -> dict:
@@ -593,11 +786,14 @@ def compute_probability_stats(records: List[dict], prob_key: str) -> dict:
 
 def write_events_report(events_path: Path, predicted_events: List[dict], gt_events: List[dict], stats: dict) -> None:
     def format_event_line(idx: int, event: dict) -> str:
-        line = f"{idx}. {event['start_time_sec']:.2f}s - {event['end_time_sec']:.2f}s"
+        duration_sec = interval_duration_sec(event)
+        line = f"{idx}. {event['start_time_sec']:.2f}s - {event['end_time_sec']:.2f}s ({duration_sec:.2f}s)"
         if event.get("start_frame") is not None and event.get("end_frame") is not None:
             line += f" (frames {int(event['start_frame'])}..{int(event['end_frame'])})"
         if event.get("event_ids"):
             line += f" events={','.join(str(event_id) for event_id in event['event_ids'])}"
+        if event.get("parts"):
+            line += f" parts={int(event['parts'])}"
         return line
 
     def append_stats_block(lines: List[str], title: str, summary: dict) -> None:
@@ -637,6 +833,74 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
     else:
         lines.append("none")
 
+    event_stats = stats.get("event_stats", {})
+    if event_stats:
+        lines.append("")
+        lines.append("Event-level stats:")
+        for key in (
+            "n_predicted_events",
+            "n_gt_events",
+            "tp",
+            "fp",
+            "fn",
+            "precision",
+            "recall",
+            "f1",
+            "false_alarms_per_min",
+            "mean_iou",
+            "median_iou",
+            "mean_gt_coverage",
+            "median_gt_coverage",
+            "mean_onset_delay_sec",
+            "median_onset_delay_sec",
+            "mean_detection_delay_sec",
+            "median_detection_delay_sec",
+            "mean_offset_error_sec",
+            "median_offset_error_sec",
+        ):
+            if key not in event_stats:
+                continue
+            value = event_stats[key]
+            if isinstance(value, float):
+                lines.append(f"{key}: {value:.4f}")
+            else:
+                lines.append(f"{key}: {value}")
+
+        matches = event_stats.get("matches", [])
+        if matches:
+            lines.append("")
+            lines.append("Matched events:")
+            for match in matches:
+                lines.append(
+                    f"GT#{match['gt_index']} <-> Pred#{match['pred_index']}: "
+                    f"overlap={match['overlap_sec']:.2f}s iou={match['iou']:.3f} "
+                    f"gt_coverage={match['gt_coverage']:.3f} onset_delay={match['onset_delay_sec']:.2f}s "
+                    f"detect_delay={match['detection_delay_sec']:.2f}s offset_error={match['offset_error_sec']:.2f}s"
+                )
+
+        unmatched_gt = event_stats.get("unmatched_gt_indices", [])
+        if unmatched_gt:
+            lines.append("")
+            lines.append("Missed GT events:")
+            lines.append(", ".join(f"GT#{idx}" for idx in unmatched_gt))
+
+        unmatched_pred = event_stats.get("unmatched_pred_indices", [])
+        if unmatched_pred:
+            lines.append("")
+            lines.append("Unmatched predicted events:")
+            lines.append(", ".join(f"Pred#{idx}" for idx in unmatched_pred))
+
+    lines.append("")
+    lines.append("Inference settings:")
+    lines.append(f"state_method: {stats.get('state_method')}")
+    lines.append(f"state_source: {stats.get('state_source')}")
+    lines.append(f"smooth_mode: {stats.get('smooth_mode')}")
+    lines.append(f"merge_gap_sec: {float(stats.get('merge_gap_sec', 0.0)):.2f}")
+    lines.append(f"min_event_sec: {float(stats.get('min_event_sec', 0.0)):.2f}")
+    lines.append(f"min_match_overlap_sec: {float(stats.get('min_match_overlap_sec', 0.0)):.2f}")
+    lines.append(f"n_predicted_events_raw: {stats.get('n_predicted_events_raw', 0)}")
+    lines.append(f"n_gt_events_raw: {stats.get('n_gt_events_raw', 0)}")
+
     lines.append("")
     lines.append("Inference stats:")
     state_title = "Thresholded state:" if stats.get("state_method") == "threshold" else "Hysteresis:"
@@ -644,7 +908,8 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
     lines.append("")
     append_stats_block(lines, "Raw probability:", stats.get("prob_raw_stats", {}))
     lines.append("")
-    append_stats_block(lines, "Smoothed probability:", stats.get("prob_smooth_stats", {}))
+    smooth_label = f"Processed probability ({stats.get('smooth_mode', 'ema')}):"
+    append_stats_block(lines, smooth_label, stats.get("prob_smooth_stats", {}))
 
     events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -653,6 +918,39 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
 def predict_prob(model: torch.nn.Module, window_btc: torch.Tensor) -> float:
     logits = model(window_btc)
     return float(torch.sigmoid(logits)[0, -1].item())
+
+
+def update_running_probability(
+    raw_prob: float,
+    smooth_mode: str,
+    ema_beta: float,
+    mean_buffer: Deque[float],
+    prev_smooth: Optional[float],
+) -> float:
+    mean_buffer.append(float(raw_prob))
+    if smooth_mode == "mean":
+        return float(np.mean(np.asarray(mean_buffer, dtype=np.float32)))
+    if smooth_mode != "ema":
+        raise ValueError(f"Unsupported smooth_mode: {smooth_mode}")
+    if prev_smooth is None or ema_beta <= 0.0:
+        return float(raw_prob)
+    return float(ema_beta * prev_smooth + (1.0 - ema_beta) * raw_prob)
+
+
+def align_motion_vector_dim(motion_vec: np.ndarray, target_dim: int) -> np.ndarray:
+    target_dim = int(target_dim)
+    motion_vec = np.asarray(motion_vec, dtype=np.float32)
+
+    if target_dim <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    if motion_vec.shape[0] == target_dim:
+        return motion_vec
+    if motion_vec.shape[0] > target_dim:
+        return motion_vec[:target_dim].astype(np.float32, copy=False)
+
+    padded = np.zeros((target_dim,), dtype=np.float32)
+    padded[: motion_vec.shape[0]] = motion_vec
+    return padded
 
 
 def main():
@@ -681,8 +979,14 @@ def main():
     ap.add_argument("--k_on", type=int, default=3)
     ap.add_argument("--k_off", type=int, default=3)
     ap.add_argument("--N", type=int, default=6)
-    ap.add_argument("--ema_beta", type=float, default=0, help="EMA smoothing beta. 0 disables.")
-    ap.add_argument("--disable_hysteresis", action="store_true", help="Threshold the score directly instead of applying hysteresis over time.")
+    ap.add_argument("--ema_beta", type=float, default=0, help="EMA smoothing beta. Only used when --smooth_mode=ema.")
+    ap.add_argument("--smooth_mode", choices=["ema", "mean"], default="ema", help="How to smooth raw probabilities before state thresholding/event evaluation.")
+    ap.add_argument("--mean_window", type=int, default=5, help="Number of inference points for moving-mean smoothing when --smooth_mode=mean.")
+    ap.add_argument("--state_source", choices=["raw", "smooth"], default="smooth", help="Probability source used for thresholding or hysteresis.")
+    ap.add_argument("--disable_hysteresis", action="store_true", help="Threshold the selected state source directly instead of applying hysteresis.")
+    ap.add_argument("--merge_gap_sec", type=float, default=0.0, help="Merge predicted and GT intervals separated by at most this gap for incident-level evaluation.")
+    ap.add_argument("--min_event_sec", type=float, default=0.0, help="Drop predicted events shorter than this duration after merging.")
+    ap.add_argument("--min_match_overlap_sec", type=float, default=0.0, help="Minimum overlap required to match a predicted incident to a GT incident.")
 
     args = ap.parse_args()
 
@@ -692,7 +996,10 @@ def main():
     ckpt_path, payload, cfg = resolve_model_artifacts(args)
     model, model_type, feature_cfg = load_model_from_payload(payload, cfg, args, device=device)
     motion_cfg = motion_feature_cfg(feature_cfg)
-    motion_dim = motion_feature_dim(feature_cfg)
+    if model_type in MOTION_ONLY_MODEL_TYPES:
+        motion_dim = int(getattr(model, "input_dim", EREZ_MOTION_DIM))
+    else:
+        motion_dim = int(getattr(model, "motion_dim", 0))
     gt = load_ground_truth(args.gt_json, args.gt_txt, positive_event_id=args.gt_positive_event_id)
 
     hyst = Hysteresis(HystCfg(args.thr_on, args.thr_off, args.k_on, args.k_off, args.N))
@@ -725,7 +1032,9 @@ def main():
     last_p: Optional[float] = None
     last_state = False
     p_smooth: Optional[float] = None
+    state_score: Optional[float] = None
     ema_beta = float(args.ema_beta)
+    smooth_buf: Deque[float] = deque(maxlen=max(int(args.mean_window), 1))
 
     frame_idx = -1
     while True:
@@ -738,8 +1047,9 @@ def main():
         if frame_idx % args.step == 0:
             sample_idx += 1
             sample_t = frame_idx / fps
-
-            r = yolo(frame, conf=args.conf, verbose=False, imgsz=(H, W))[0]
+            n_H = H if H % 32 == 0 else H + (32 - (H%32))
+            n_W = W if W % 32 == 0 else W + (32 - (W%32))
+            r = yolo(frame, conf=args.conf, verbose=False, imgsz=(n_H, n_W))[0]
             frame, det_list = frame_to_detection_list(frame, W, H, r, conf_thresh=args.conf)
             frame_payload = {
                 "f": frame_idx,
@@ -755,6 +1065,7 @@ def main():
                         align=motion_cfg.get("align", "prev"),
                         j_version=feature_cfg.get("erez_json_version", 2.0),
                     )[-1]
+                    motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
                     vec_buf.append(motion_vec.astype(np.float32))
                     motion_idx += 1
 
@@ -763,15 +1074,17 @@ def main():
                         x = torch.from_numpy(win_np).to(device)
                         last_p = predict_prob(model, x)
 
-                        if ema_beta <= 0.0:
-                            p_smooth = last_p
-                        elif p_smooth is None:
-                            p_smooth = last_p
-                        else:
-                            p_smooth = ema_beta * p_smooth + (1.0 - ema_beta) * last_p
+                        p_smooth = update_running_probability(
+                            raw_prob=float(last_p),
+                            smooth_mode=str(args.smooth_mode),
+                            ema_beta=ema_beta,
+                            mean_buffer=smooth_buf,
+                            prev_smooth=p_smooth,
+                        )
+                        state_score = float(last_p) if args.state_source == "raw" else float(p_smooth)
 
                         last_state = update_state(
-                            score=float(p_smooth),
+                            score=float(state_score),
                             hyst=hyst,
                             disable_hysteresis=bool(args.disable_hysteresis),
                             threshold=float(args.thr_on),
@@ -791,6 +1104,7 @@ def main():
                             align=motion_cfg.get("align", "prev"),
                             j_version=feature_cfg.get("erez_json_version", 2.0),
                         )[-1]
+                        motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
                     x_t = np.concatenate([x_t, motion_vec], axis=0).astype(np.float32)
 
                 vec_buf.append(x_t)
@@ -801,15 +1115,17 @@ def main():
                     x = torch.from_numpy(win_np).to(device)
                     last_p = predict_prob(model, x)
 
-                    if ema_beta <= 0.0:
-                        p_smooth = last_p
-                    elif p_smooth is None:
-                        p_smooth = last_p
-                    else:
-                        p_smooth = ema_beta * p_smooth + (1.0 - ema_beta) * last_p
+                    p_smooth = update_running_probability(
+                        raw_prob=float(last_p),
+                        smooth_mode=str(args.smooth_mode),
+                        ema_beta=ema_beta,
+                        mean_buffer=smooth_buf,
+                        prev_smooth=p_smooth,
+                    )
+                    state_score = float(last_p) if args.state_source == "raw" else float(p_smooth)
 
                     last_state = update_state(
-                        score=float(p_smooth),
+                        score=float(state_score),
                         hyst=hyst,
                         disable_hysteresis=bool(args.disable_hysteresis),
                         threshold=float(args.thr_on),
@@ -825,6 +1141,7 @@ def main():
                         "time_sec": sample_t,
                         "prob": last_p,
                         "prob_smooth": p_smooth,
+                        "state_score": state_score,
                         "pred_state": int(last_state),
                         "gt_label": gt_label,
                     }
@@ -832,7 +1149,7 @@ def main():
 
         frame_time_sec = frame_idx / fps
         gt_now = gt.label_for(frame_idx, frame_time_sec)
-        txt1 = f"p={last_p:.3f} ps={p_smooth:.3f}" if last_p is not None else "p=..."
+        txt1 = f"p={last_p:.3f} ps={p_smooth:.3f} ss={state_score:.3f}" if last_p is not None and p_smooth is not None and state_score is not None else "p=..."
         txt2 = "ABNORMAL=ON" if last_state else "ABNORMAL=OFF"
         txt3 = "infer" if did_infer else ""
         txt4 = f"model={model_type}"
@@ -856,12 +1173,38 @@ def main():
     cap.release()
     outv.release()
 
-    predicted_events = build_intervals(records, label_key="pred_state")
-    gt_events = gt.positive_intervals(fps=fps)
+    infer_dt_sec = float(args.step * args.stride) / float(fps) if fps > 0 else 0.0
+    infer_span_frames = max(int(args.step * args.stride), 1)
+    predicted_events_raw = build_intervals(
+        records,
+        label_key="pred_state",
+        span_frames=infer_span_frames,
+        span_sec=infer_dt_sec,
+    )
+    predicted_events = postprocess_intervals(
+        predicted_events_raw,
+        merge_gap_sec=float(args.merge_gap_sec),
+        min_duration_sec=float(args.min_event_sec),
+    )
+    gt_events_raw = gt.positive_intervals(fps=fps)
+    gt_events = postprocess_intervals(
+        gt_events_raw,
+        merge_gap_sec=float(args.merge_gap_sec),
+        min_duration_sec=0.0,
+    )
 
     hyst_stats = compute_binary_stats(records)
     prob_raw_stats = compute_probability_stats(records, prob_key="prob")
     prob_smooth_stats = compute_probability_stats(records, prob_key="prob_smooth")
+    video_duration_sec = float((frame_idx + 1) / fps) if frame_idx >= 0 and fps > 0 else 0.0
+    event_stats = {}
+    if gt.source_kind:
+        event_stats = compute_event_stats(
+            predicted_events,
+            gt_events,
+            video_duration_sec=video_duration_sec,
+            min_overlap_sec=float(args.min_match_overlap_sec),
+        )
 
     stats = dict(hyst_stats)
     stats.update(
@@ -877,13 +1220,22 @@ def main():
             "gt_positive_event_id": int(gt.positive_event_id),
             "hysteresis_enabled": bool(not args.disable_hysteresis),
             "state_method": "threshold" if args.disable_hysteresis else "hysteresis",
+            "state_source": str(args.state_source),
+            "smooth_mode": str(args.smooth_mode),
             "state_threshold": float(args.thr_on),
+            "merge_gap_sec": float(args.merge_gap_sec),
+            "min_event_sec": float(args.min_event_sec),
+            "min_match_overlap_sec": float(args.min_match_overlap_sec),
+            "inference_dt_sec": float(infer_dt_sec),
             "n_predictions": len(records),
+            "n_predicted_events_raw": len(predicted_events_raw),
             "n_predicted_events": len(predicted_events),
+            "n_gt_events_raw": len(gt_events_raw),
             "n_gt_events": len(gt_events),
             "hysteresis_stats": hyst_stats,
             "prob_raw_stats": prob_raw_stats,
             "prob_smooth_stats": prob_smooth_stats,
+            "event_stats": event_stats,
         }
     )
 

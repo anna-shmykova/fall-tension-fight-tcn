@@ -1,30 +1,35 @@
 """     Extract order-free motion features from JSON frame sequences.
     This file converts per-frame detections/keypoints into a clip-level motion
     representation. The main entry point is `extract_motion_features(...)`, which
-    builds one 21-dim feature vector for each pair of consecutive frames.
+    builds one 25-dim feature vector for each pair of consecutive frames.
     Feature order:
-    1.  d_mean_center_x      : change in mean bbox center x; global horizontal crowd motion
-    2.  d_mean_center_y      : change in mean bbox center y; global vertical crowd motion
-    3.  d_var_center_x       : change in bbox-center variance on x; horizontal spread/compression
-    4.  d_var_center_y       : change in bbox-center variance on y; vertical spread/compression
-    5.  d_mean_size_w        : change in mean bbox width; average scale/depth change
-    6.  d_mean_size_h        : change in mean bbox height; average scale/depth change
-    7.  d_max_size_w         : change in largest bbox width; strongest scale change
-    8.  d_max_size_h         : change in largest bbox height; strongest scale change
+    1.  d_mean_center_x      : change in mean bbox center (x,y); global  crowd motion
+    2.  d_mean_center_y      :
+    3.  d_var_center_x       : change in bbox-center variance;  spread/compression
+    4.  d_var_center_y       :
+    5.  d_mean_size_w        : change in mean bbox size (width/height); average scale/depth change
+    6.  d_mean_size_h        :
+    7.  d_max_size_w         : change in largest bbox size; strongest scale change
+    8.  d_max_size_h         :
     9.  d_mean_pairwise      : change in mean pairwise bbox-center distance; crowd density cue
     10. d_var_pairwise       : change in variance of pairwise distances; spacing heterogeneity
-    11. d_kp_mean_x          : change in mean keypoint x; global articulated horizontal motion
-    12. d_kp_mean_y          : change in mean keypoint y; global articulated vertical motion
-    13. d_kp_var_x           : change in keypoint variance on x; pose spread horizontally
-    14. d_kp_var_y           : change in keypoint variance on y; pose spread vertically
+    11. d_kp_mean_x          : change in mean keypoint(x, y); global articulated  motion
+    12. d_kp_mean_y          :
+    13. d_kp_var_x           : change in keypoint variance; pose spread
+    14. d_kp_var_y           :
     15. bb_nn_mean           : mean nearest-neighbor bbox-center motion; average object motion
     16. bb_nn_max            : max nearest-neighbor bbox-center motion; strongest mover
     17. kp_nn_mean           : mean nearest-neighbor keypoint motion; average articulated motion
     18. kp_nn_max            : max nearest-neighbor keypoint motion; strongest articulated motion
-    #*  added later (14/03/26)
+    * Added later (14/03/26)
     19. d_union_coverage     : change in union area covered by all bboxes
     20. d_mean_pairwise_iou  : change in mean pairwise bbox IoU
     21. d_max_pairwise_iou   : change in max pairwise bbox IoU
+    * Static features
+    22. union_coverage       : union area covered by all bboxes in frame t+1
+    23. mean_pairwise_iou    : mean pairwise bbox IoU in frame t+1
+    24. max_pairwise_iou     : max pairwise bbox IoU in frame t+1
+    25. overlap_ratio        : redundant bbox overlap ratio in frame t+1
 """
 
 import numpy as np
@@ -36,9 +41,12 @@ DEFAULT_VERSION = 2.0
 # * public fucntion, to be used by other units
 # --------------------------------------------------
 
-def extract_motion_features(frames, j_version:float=DEFAULT_VERSION): # **kwargs):
-    """    Converts a list of frames into a T x C motion feature sequence.
-         former  compute_motion_sequence"""
+def extract_motion_features(frames, j_version:float=DEFAULT_VERSION, **kwargs):
+    """Convert frames into a T x C motion sequence.
+    Kwargs:
+        pure_motion: if True, drop the static overlap features (22-25).
+        legacy: if True, return only the original 18 features.
+    """
     frame_feats = []
     raw_points = []
 
@@ -58,24 +66,35 @@ def extract_motion_features(frames, j_version:float=DEFAULT_VERSION): # **kwargs
     motion_feats = []
     for t in range(len(frames) - 1):
         delta_agg = frame_feats[t + 1] - frame_feats[t]
+        curr_agg = frame_feats[t + 1]
 
         bb_c_t, kp_t = raw_points[t]
         bb_c_tp1, kp_tp1 = raw_points[t + 1]
 
+        #* Nearest Neighbor Motion
         bb_mean, bb_max = nearest_neighbor_motion(bb_c_t, bb_c_tp1)
         kp_mean, kp_max = nearest_neighbor_motion(kp_t, kp_tp1)
+        nnm_features = np.array([bb_mean, bb_max, kp_mean, kp_max], dtype=np.float32)
 
-        motion_vec = np.concatenate([delta_agg,
-                                     np.array([bb_mean, bb_max, kp_mean, kp_max], dtype=np.float32),])
+        motion_vec = np.concatenate([delta_agg[:14],
+                                    nnm_features,
+                                    delta_agg[14:17],   #* d_union_coverage, d_mean_pairwise_iou, d_max_pairwise_iou
+                                    curr_agg[14:17],    #* union_coverage, mean_pairwise_iou, max_pairwise_iou
+                                    curr_agg[17:18],    #* overlap_ratio
+                                     ])
         motion_feats.append(motion_vec)
 
-    return np.stack(motion_feats)  # (T-1) x C'
+    motion_feats = np.stack(motion_feats)
+    if kwargs.get('legacy', False):      #* The original 18 features, for backward compatibility with old models
+        return motion_feats[:, :18]
+    if kwargs.get('pure_motion', False): #* Exclude static features
+        return motion_feats[:, :21]
+    return motion_feats  # (T-1) x C'
 
 
 # -------------------------------------------------
 # * private function; local helpers for compute_motion_sequence
 # --------------------------------------------------
-
 
 # ***** Step 1:  extract frame-level geometry ****
 def extract_frame_geometry(frame, **kwargs):
@@ -183,6 +202,26 @@ def _pairwise_iou_stats(bboxes):
     return float(vals.mean()), float(vals.max())
 
 
+def _overlap_ratio(bboxes):
+    """Return redundant overlap ratio: (sum_area - union_area) / sum_area."""
+    if len(bboxes) == 0:
+        return 0.0
+
+    boxes = np.asarray(bboxes, dtype=np.float64).copy()
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, 1.0)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, 1.0)
+    boxes = boxes[(boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])]
+    if len(boxes) == 0:
+        return 0.0
+
+    sum_area = np.sum((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]))
+    if sum_area <= 0:
+        return 0.0
+
+    union_area = _bbox_union_area(boxes)
+    return float(max(0.0, sum_area - union_area) / sum_area)
+
+
 # *****  Step 2: compute per-frame aggregate descriptors
 def frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes):
     """ Compute order-free, tracking-free aggregates for one frame.
@@ -211,10 +250,11 @@ def frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes):
             var_pairwise = 0.0
         union_coverage = _bbox_union_area(bboxes)
         mean_pairwise_iou, max_pairwise_iou = _pairwise_iou_stats(bboxes)
+        overlap_ratio = _overlap_ratio(bboxes)
     else:
         mean_center = var_center = mean_size = max_size = np.zeros(2)
         mean_pairwise = var_pairwise = 0.0
-        union_coverage = mean_pairwise_iou = max_pairwise_iou = 0.0
+        union_coverage = mean_pairwise_iou = max_pairwise_iou = overlap_ratio = 0.0
 
     feats.extend(mean_center)
     feats.extend(var_center)
@@ -222,10 +262,6 @@ def frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes):
     feats.extend(max_size)
     feats.append(mean_pairwise)
     feats.append(var_pairwise)
-    feats.append(union_coverage)
-    feats.append(mean_pairwise_iou)
-    feats.append(max_pairwise_iou)
-
     #* keypoints
     if len(keypoints) > 0:
         kp_mean = keypoints.mean(axis=0)
@@ -234,6 +270,10 @@ def frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes):
         kp_mean = kp_var = np.zeros(2)
     feats.extend(kp_mean)
     feats.extend(kp_var)
+    feats.append(union_coverage)
+    feats.append(mean_pairwise_iou)
+    feats.append(max_pairwise_iou)
+    feats.append(overlap_ratio)
 
     return np.asarray(feats, dtype=np.float32)
 
@@ -505,13 +545,14 @@ if __name__ == '__main__':
         from my_local_utils import print_color
 
     # json_example = "/mnt/local-data/Projects/Wesmart/data/usual_jsons_from_events/event_18.json"
-    json_example = "data/json_data/full_ann_w_keys/new_21_1_keypoints.json"
-    json_newfrmt = "data/json_data/jsons_nf/cam3_5_4.json"
-    static_json_ = "/mnt/local-data/Python/Projects/weSmart/data/json_data/static_clip.json"
+    # json_example = "data/json_data/full_ann_w_keys/new_21_1_keypoints.json"
+    # json_newfrmt = "data/json_data/jsons_nf/cam3_5_4.json"
+    json_example = "data/json_files/tst_conv/try_03 (tms)/Russian_Road_Rage- Micky_Mouse_&_Sponge_Bob.json"
+    # static_json_ = "data/json_data/static_clip.json"
 
     test_motion_sequence(load_json_data(json_example), eps=1e-5)
     print_color("✔✔✔ Old Format OK !\n", 'g')
-    test_motion_sequence(load_json_data(json_newfrmt, j_type='2'), eps=1e-5)
+    test_motion_sequence(load_json_data(json_example, j_type='2'), eps=1e-5)
     print_color("✔✔✔ New Format OK !\n", 'g')
 
     pass

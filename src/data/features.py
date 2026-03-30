@@ -5,7 +5,7 @@ from src.erez_files.analyze_json_motion import (
 )
 
 
-EREZ_MOTION_DIM = 21
+EREZ_MOTION_DIM = 25
 
 
 def _get_detections(frame):
