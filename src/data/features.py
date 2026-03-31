@@ -38,7 +38,14 @@ def motion_feature_dim(feature_cfg=None):
         return 0
     if motion_cfg.get("source") != "erez":
         raise ValueError(f"Unsupported motion feature source: {motion_cfg.get('source')}")
-    return EREZ_MOTION_DIM
+
+    requested_dim = motion_cfg.get("num_features", motion_cfg.get("first_n", EREZ_MOTION_DIM))
+    requested_dim = int(requested_dim)
+    if requested_dim <= 0 or requested_dim > EREZ_MOTION_DIM:
+        raise ValueError(
+            f"features.motion.num_features must be in [1, {EREZ_MOTION_DIM}], got {requested_dim}"
+        )
+    return requested_dim
 
 
 def _to_erez_frame(frame):
@@ -108,6 +115,20 @@ def frame_to_vector(frame, K, num_pers_features=40, cfg=None):
     n_people_norm = len(detections) / 25
     x_t = boxes + [float(n_people_norm)]
     return np.array(x_t, dtype=np.float32)
+
+
+def select_motion_features(motion_values, target_dim: int):
+    motion_values = np.asarray(motion_values, dtype=np.float32)
+    target_dim = int(target_dim)
+    if target_dim < 0 or target_dim > EREZ_MOTION_DIM:
+        raise ValueError(f"target_dim must be in [0, {EREZ_MOTION_DIM}], got {target_dim}")
+    if motion_values.shape[-1] < target_dim:
+        raise ValueError(
+            f"Motion feature tensor has width {motion_values.shape[-1]}, cannot keep first {target_dim} features"
+        )
+    if motion_values.shape[-1] == target_dim:
+        return motion_values.astype(np.float32, copy=False)
+    return motion_values[..., :target_dim].astype(np.float32, copy=False)
 
 
 def extract_erez_motion_features(frames, align="prev", j_version=EREZ_DEFAULT_VERSION):

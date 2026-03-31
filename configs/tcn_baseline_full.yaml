@@ -37,6 +37,7 @@ features:
     enabled: true
     source: erez
     align: prev       # prev avoids future leakage; next matches t->t+1 extraction
+    num_features: 25  # keep the first N motion features from analyze_json_motion.py
 
 model:
   type: "tcn"

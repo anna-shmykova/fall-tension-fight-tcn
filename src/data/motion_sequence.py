@@ -4,11 +4,9 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+from src.data.features import motion_feature_dim, select_motion_features
 from src.data.labels import events_to_label
 from src.erez_files.analyze_json_motion import extract_motion_features
-
-
-MOTION_FEATURE_DIM = 25
 
 
 def adapt_frame_for_erez(frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -42,15 +40,17 @@ def adapt_frames_for_erez(frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def build_motion_sequence(frames, feature_cfg: Dict[str, Any] | None = None):
     feature_cfg = feature_cfg or {}
     j_version = float(feature_cfg.get("erez_json_version", 2.0))
+    motion_dim = motion_feature_dim(feature_cfg)
 
     if len(frames) < 2:
         return (
-            np.zeros((0, MOTION_FEATURE_DIM), dtype=np.float32),
+            np.zeros((0, motion_dim), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
 
     frames_erez = adapt_frames_for_erez(frames)
     X = extract_motion_features(frames_erez, j_version=j_version).astype(np.float32)
+    X = select_motion_features(X, target_dim=motion_dim)
 
     # Motion feature x[t] describes the transition from frames[t] -> frames[t+1].
     # Align it with the later frame label so the sequence stays causal.
