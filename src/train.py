@@ -22,9 +22,9 @@ from src.data.splits import (
     write_paths_txt,
     write_split_files,
 )
-from src.data.dataset import EventJsonDataset, MotionJsonDataset
+from src.data.dataset import EventJsonDataset, MotionJsonDataset, resolve_window_label_cfg
 from src.data.json_io import read_json_frames
-from src.data.labels import events_to_label
+from src.data.labels import events_to_label, resolve_label_cfg
 from src.data.features import motion_feature_dim
 from src.models.tcn import EventTCN, MotionTCN
 from src.utils.metrics import (
@@ -154,6 +154,63 @@ def assert_disjoint(a_name: str, a_paths: List[str], b_name: str, b_paths: List[
         raise ValueError(f"{a_name} and {b_name} overlap ({len(overlap)} files). First entries:\n{preview}")
 
 
+def resolve_window_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    window_cfg = dict(cfg.get("window_labels", {}) or {})
+
+    if "rule" not in window_cfg and data_cfg.get("window_label_rule") is not None:
+        window_cfg["rule"] = data_cfg.get("window_label_rule")
+    if "positive_overlap" not in window_cfg:
+        if data_cfg.get("window_positive_overlap") is not None:
+            window_cfg["positive_overlap"] = data_cfg.get("window_positive_overlap")
+        elif data_cfg.get("window_positive_overlap_fraction") is not None:
+            window_cfg["positive_overlap"] = data_cfg.get("window_positive_overlap_fraction")
+
+    return resolve_window_label_cfg(window_cfg)
+
+
+def resolve_label_cfg_from_root(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    label_cfg = dict(cfg.get("labels", {}) or {})
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+
+    if "mode" not in label_cfg and data_cfg.get("label_mode") is not None:
+        label_cfg["mode"] = data_cfg.get("label_mode")
+
+    return resolve_label_cfg(label_cfg)
+
+
+def warn_ignored_cfg_fields(cfg: Dict[str, Any], model_type: str, split_mode: str) -> None:
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    feature_cfg = cfg.get("features", {}) if isinstance(cfg, dict) else {}
+    split_cfg = data_cfg.get("split", {}) if isinstance(data_cfg, dict) else {}
+
+    if split_mode in {"generate", "train_test_lists"} and split_cfg.get("group_key") is not None:
+        print(
+            f"[WARN] data.split.group_key={split_cfg.get('group_key')!r} is currently ignored by the split implementation; "
+            "generated splits are path-level.",
+            flush=True,
+        )
+
+    if model_type not in {"motion_tcn", "erez_motion_tcn"}:
+        ignored_feature_keys = [
+            key for key in ("use_bbox", "use_keypoints", "use_quality_gates", "normalize")
+            if key in feature_cfg
+        ]
+        if ignored_feature_keys:
+            print(
+                f"[WARN] EventTCN input currently ignores features.{', features.'.join(ignored_feature_keys)}; "
+                "the per-person pose vector format is still fixed in frame_to_vector.",
+                flush=True,
+            )
+
+        ignored_data_keys = [key for key in ("det_conf_keep", "kp_conf_keep") if key in data_cfg]
+        if ignored_data_keys:
+            print(
+                f"[WARN] Training input currently ignores data.{', data.'.join(ignored_data_keys)}.",
+                flush=True,
+            )
+
+
 def build_dataset(
     dataset_cls,
     paths: List[str],
@@ -163,6 +220,7 @@ def build_dataset(
     window_step: int,
     feature_cfg: Dict[str, Any],
     label_cfg: Dict[str, Any],
+    window_cfg: Dict[str, Any],
     target_mode: str,
     verbose: bool = True,
 ):
@@ -173,6 +231,7 @@ def build_dataset(
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
         verbose=verbose,
     )
@@ -359,6 +418,7 @@ def evaluate_paths_individually(
     window_step: int,
     feature_cfg: Dict[str, Any],
     label_cfg: Dict[str, Any],
+    window_cfg: Dict[str, Any],
     target_mode: str,
     batch_size: int,
     num_workers: int,
@@ -379,6 +439,7 @@ def evaluate_paths_individually(
                 window_step=window_step,
                 feature_cfg=feature_cfg,
                 label_cfg=label_cfg,
+                window_cfg=window_cfg,
                 target_mode=target_mode,
                 batch_size=batch_size,
                 num_workers=num_workers,
@@ -401,6 +462,7 @@ def evaluate_single_path(
     window_step: int,
     feature_cfg: Dict[str, Any],
     label_cfg: Dict[str, Any],
+    window_cfg: Dict[str, Any],
     target_mode: str,
     batch_size: int,
     num_workers: int,
@@ -422,6 +484,7 @@ def evaluate_single_path(
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
         verbose=False,
     )
@@ -633,6 +696,10 @@ def main() -> None:
     cfg_resolved["paths"]["runs_root"] = str(runs_root)
     cfg_resolved["data"] = dict(cfg_resolved.get("data", {}))
     cfg_resolved["data"]["target_mode"] = target_mode
+    window_cfg = resolve_window_cfg(cfg)
+    cfg_resolved["window_labels"] = dict(window_cfg)
+    label_cfg = resolve_label_cfg_from_root(cfg)
+    cfg_resolved["labels"] = dict(label_cfg)
     cfg_resolved["train"] = dict(cfg_resolved.get("train", {}))
     cfg_resolved["train"]["save_all_checkpoints"] = save_all_checkpoints
     cfg_resolved["run_dir"] = str(run_dir)
@@ -645,6 +712,8 @@ def main() -> None:
     all_jsons = normalize_paths(collect_json_paths(data_root))
     if len(all_jsons) == 0:
         raise RuntimeError(f"No jsons found under {data_root}")
+    print(f"[INFO] data_root: {data_root}", flush=True)
+    print(f"[INFO] found {len(all_jsons)} json files under data_root", flush=True)
 
     # 5) Make or load split
     split_cfg = cfg.get("data", {}).get("split", {"mode": "generate"})
@@ -720,18 +789,28 @@ def main() -> None:
             #base=data_root,  # write relative paths to data_root
         )
 
+    print(f"[INFO] run_dir:   {run_dir}", flush=True)
+    print(
+        f"[INFO] split_mode: {split_mode} | {len(train_paths)} train_jsons | {len(val_paths)} val_jsons"
+        + (f" | {len(test_paths)} test_jsons" if test_paths else ""),
+        flush=True,
+    )
+
     # 6) Build datasets
     K = int(cfg["data"].get("max_persons", 25))
     window_size = int(cfg["data"].get("window_size", 16))
     window_step = int(cfg["data"].get("window_step", 4))
 
     feature_cfg = cfg.get("features", {})
-    label_cfg = cfg.get("labels", {})
+    label_cfg = resolve_label_cfg_from_root(cfg)
+    window_cfg = resolve_window_cfg(cfg)
     model_cfg = cfg.get("model", {})
     model_type = str(model_cfg.get("type", "tcn")).lower()
     motion_dim = motion_feature_dim(feature_cfg)
     dataset_cls = MotionJsonDataset if model_type in {"motion_tcn", "erez_motion_tcn"} else EventJsonDataset
+    warn_ignored_cfg_fields(cfg, model_type=model_type, split_mode=split_mode)
 
+    print("[INFO] Building training dataset...", flush=True)
     train_ds = build_dataset(
         dataset_cls,
         train_paths,
@@ -740,8 +819,10 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
     )
+    print("[INFO] Building validation dataset...", flush=True)
     val_ds = build_dataset(
         dataset_cls,
         val_paths,
@@ -750,10 +831,12 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
     )
     test_ds = None
     if test_paths:
+        print("[INFO] Building test dataset...", flush=True)
         test_ds = build_dataset(
             dataset_cls,
             test_paths,
@@ -762,6 +845,7 @@ def main() -> None:
             window_step=window_step,
             feature_cfg=feature_cfg,
             label_cfg=label_cfg,
+            window_cfg=window_cfg,
             target_mode=target_mode,
         )
 
@@ -811,6 +895,7 @@ def main() -> None:
             input_dim=C,
             hidden_dim=int(model_cfg.get("hidden_dim", 64)),
             num_layers=int(model_cfg.get("num_layers", 4)),
+            dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),
@@ -821,6 +906,7 @@ def main() -> None:
             input_dim=C,
             hidden_dim=int(model_cfg.get("hidden_dim", 64)),
             num_layers=int(model_cfg.get("num_layers", 4)),
+            dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
             mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
             pool_mode=str(model_cfg.get("pool_mode", "attn")),
@@ -862,8 +948,12 @@ def main() -> None:
     temperature = cfg["train"].get("logsumexp_temperature", 1.0)
     end_loss_alpha = cfg["train"].get("end_loss_alpha", 0.5)
     end_loss_k = cfg["train"].get("end_loss_k", 4)
+    early_stop_patience = cfg["train"].get("early_stop_patience", None)
+    early_stop_patience = int(early_stop_patience) if early_stop_patience is not None else None
 
     print(f"[INFO] target_mode: {target_mode}")
+    print(f"[INFO] window_label_rule: {window_cfg['rule']} (positive_overlap={window_cfg['positive_overlap']:.2f})")
+    print(f"[INFO] labels: {label_cfg}")
     if bool(model_cfg.get("causal", True)) and target_mode != "last":
         print("[WARN] model.causal=true but data.target_mode is not 'last'.")
     if target_mode == "last" and str(agg_mode).lower() != "last":
@@ -875,6 +965,7 @@ def main() -> None:
     best_epoch = 0
     best_val_threshold = None
     history = []
+    epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(
@@ -951,6 +1042,7 @@ def main() -> None:
             best_auprc = val_auprc
             best_epoch = epoch
             best_val_threshold = float(val_out["best_f1"]["threshold"])
+            epochs_without_improvement = 0
             ckpt_path = checkpoints_dir / "best.pt"
             ckpt_payload["best_auprc"] = float(best_auprc)
             torch.save(ckpt_payload, ckpt_path)
@@ -1000,9 +1092,17 @@ def main() -> None:
                 y_prob=np.asarray(val_out["probs"], dtype=np.float32),
                 title="Validation Precision-Recall Curve",
             )
-    
+            
             # Plots for best checkpoint moment (optional)
             save_learning_curves(reports_dir, history)
+        else:
+            epochs_without_improvement += 1
+            if early_stop_patience is not None and epochs_without_improvement >= early_stop_patience:
+                print(
+                    f"[EARLY STOP] No validation AUPRC improvement for {epochs_without_improvement} "
+                    f"epoch(s); patience={early_stop_patience}."
+                )
+                break
 
     if test_ds is not None:
         final_test_dir = run_dir / "final_test"
@@ -1035,6 +1135,7 @@ def main() -> None:
                 window_step=window_step,
                 feature_cfg=feature_cfg,
                 label_cfg=label_cfg,
+                window_cfg=window_cfg,
                 target_mode=target_mode,
                 batch_size=bs,
                 num_workers=num_workers,
@@ -1053,6 +1154,7 @@ def main() -> None:
                 window_step=window_step,
                 feature_cfg=feature_cfg,
                 label_cfg=label_cfg,
+                window_cfg=window_cfg,
                 target_mode=target_mode,
                 batch_size=bs,
                 num_workers=num_workers,

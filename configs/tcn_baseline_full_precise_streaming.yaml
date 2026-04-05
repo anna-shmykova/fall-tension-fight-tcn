@@ -1,0 +1,81 @@
+exp:
+  name: tcn_event_graph_pool_motion_21_wind_8_dataset_v2_precise_streaming
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v2
+  runs_root: /home/anna/TCN_TRAIN/runs
+
+data:
+  label_mode: binary_tension
+  target_mode: last
+  window_size: 8
+  window_step: 4
+  fps: 25
+  sample_every_n_frames: 5
+  max_persons: 25
+
+  split:
+    mode: fixed #generate
+    seed: 42
+    val_ratio: 0.2
+    train_list: "fixed_splits/train_paths.txt"
+    val_list: "fixed_splits/val_paths.txt"
+
+window_labels:
+  rule: target
+  positive_overlap: 0.30
+
+labels:
+  mode: binary_tension
+  positive_event_id: 4
+
+features:
+  use_bbox: true
+  use_keypoints: false
+  use_quality_gates: true
+  normalize: bbox
+  motion:
+    enabled: true
+    source: erez
+    align: prev
+    num_features: 21
+
+model:
+  type: tcn
+  use_graph: true
+  use_attention_readout: false
+  causal: true
+  norm: group
+  hidden_dim: 64
+  num_layers: 4
+  dilations: [1, 2, 4, 8]
+  kernel_size: 3
+  dropout: 0.2
+  mlp_out_dim: 32
+  pool_mode: mean_max_std
+  tcn_input_mode: pooled_count_motion
+  use_person_count: true
+  motion_proj_dim: 32
+
+train:
+  batch_size: 32
+  epochs: 15
+  lr: 0.0005
+  weight_decay: 0.0001
+  pos_weight: 2.0
+  grad_clip: 1.0
+  early_stop_patience: 3
+  num_workers: 0
+  device: cuda
+  agg_mode: last
+  logsumexp_temperature: 1.0
+  end_loss_alpha: 0.0
+  end_loss_k: 1
+  save_all_checkpoints: true
+
+eval:
+  threshold_sweep:
+    start: 0.01
+    end: 0.99
+    step: 0.01

@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from src.data.motion_sequence import MOTION_FEATURE_DIM, adapt_frame_for_erez
+from src.data.features import EREZ_MOTION_DIM
+from src.data.motion_sequence import adapt_frame_for_erez
 from src.erez_files.analyze_json_motion import extract_motion_features
 from src.models.tcn import MotionTCN
 
@@ -89,7 +90,7 @@ def infer_input_dim_from_state_dict(state_dict: dict) -> int:
         if key in state_dict:
             return int(state_dict[key].shape[1])
 
-    return MOTION_FEATURE_DIM
+    return EREZ_MOTION_DIM
 
 
 def infer_kernel_size_from_state_dict(state_dict: dict) -> int:
@@ -131,6 +132,7 @@ def load_motion_model(ckpt_path: str, device: torch.device) -> MotionTCN:
         input_dim=input_dim,
         hidden_dim=int(model_cfg.get("hidden_dim", state_dict["head.weight"].shape[1])),
         num_layers=int(model_cfg.get("num_layers", infer_num_layers_from_state_dict(state_dict))),
+        dilations=model_cfg.get("dilations"),
         kernel_size=int(model_cfg.get("kernel_size", infer_kernel_size_from_state_dict(state_dict))),
         causal=bool(model_cfg.get("causal", True)),
         norm=str(model_cfg.get("norm", "group")),

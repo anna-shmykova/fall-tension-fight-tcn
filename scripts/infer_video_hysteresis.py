@@ -404,6 +404,7 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
             input_dim=input_dim,
             hidden_dim=int(model_cfg.get("hidden_dim", state_dict["head.weight"].shape[1])),
             num_layers=int(model_cfg.get("num_layers", infer_num_layers_from_state_dict(state_dict))),
+            dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", infer_kernel_size_from_state_dict(state_dict))),
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),
@@ -484,6 +485,7 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
             input_dim=C,
             hidden_dim=int(model_cfg.get("hidden_dim", 64)),
             num_layers=int(model_cfg.get("num_layers", 4)),
+            dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
             mlp_out_dim=mlp_out_dim,
             pool_mode=pool_mode,
@@ -616,23 +618,131 @@ def resolve_frame_time_sec(
     nominal_time_sec = float(frame_idx) / float(nominal_fps) if nominal_fps > 0 else 0.0
     time_source = str(time_source).lower()
 
-    if time_source not in {"auto", "video", "nominal"}:
+    if time_source not in {"auto", "video", "strict_video", "nominal"}:
         raise ValueError(f"Unsupported time_source: {time_source}")
 
-    if time_source in {"auto", "video"}:
+    video_error = "video timestamps unavailable"
+    if time_source in {"auto", "video", "strict_video"}:
         pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
-        if pos_msec is not None:
+        if pos_msec is None:
+            video_error = "CAP_PROP_POS_MSEC returned None"
+        else:
             try:
                 video_time_sec = float(pos_msec) / 1000.0
             except (TypeError, ValueError):
                 video_time_sec = None
-            if video_time_sec is not None and np.isfinite(video_time_sec) and video_time_sec >= 0.0:
-                if prev_time_sec is None or video_time_sec >= float(prev_time_sec) - 1e-3:
+                video_error = f"invalid CAP_PROP_POS_MSEC value: {pos_msec!r}"
+            else:
+                if not np.isfinite(video_time_sec) or video_time_sec < 0.0:
+                    video_error = f"non-finite or negative video timestamp: {video_time_sec!r}"
+                elif prev_time_sec is not None and video_time_sec < float(prev_time_sec) - 1e-3:
+                    video_error = f"non-monotonic video timestamp {video_time_sec:.6f}s after {float(prev_time_sec):.6f}s"
+                else:
                     return float(video_time_sec), "video"
+
+    if time_source == "strict_video":
+        raise RuntimeError(f"Failed to resolve a usable video timestamp at frame {frame_idx}: {video_error}")
 
     if prev_time_sec is not None:
         nominal_time_sec = max(float(nominal_time_sec), float(prev_time_sec))
     return float(nominal_time_sec), "nominal"
+
+
+def resolve_training_sample_period_sec(cfg: dict) -> Optional[float]:
+    if not isinstance(cfg, dict):
+        return None
+
+    data_cfg = cfg.get("data", {})
+    try:
+        train_fps = float(data_cfg.get("fps", 0.0))
+    except (TypeError, ValueError):
+        train_fps = 0.0
+    try:
+        train_step = int(data_cfg.get("sample_every_n_frames", 0))
+    except (TypeError, ValueError):
+        train_step = 0
+
+    if train_fps > 0.0 and train_step > 0:
+        return float(train_step) / float(train_fps)
+    return None
+
+
+def resolve_sampling_cfg(args, cfg: dict, nominal_fps: float) -> dict:
+    requested_mode = str(getattr(args, "sample_mode", "auto")).lower()
+    if requested_mode not in {"auto", "frames", "time"}:
+        raise ValueError(f"Unsupported sample_mode: {requested_mode}")
+
+    sample_every_n_frames = max(int(getattr(args, "step", 1)), 1)
+    requested_period_sec = getattr(args, "sample_period_sec", None)
+    if requested_period_sec is not None:
+        requested_period_sec = float(requested_period_sec)
+        if requested_period_sec <= 0.0:
+            raise ValueError(f"sample_period_sec must be > 0, got {requested_period_sec}")
+
+    training_period_sec = resolve_training_sample_period_sec(cfg)
+    nominal_period_sec = float(sample_every_n_frames) / float(nominal_fps) if nominal_fps > 0 else None
+
+    if requested_mode == "frames":
+        resolved_mode = "frames"
+    elif requested_mode == "time":
+        resolved_mode = "time"
+    else:
+        resolved_mode = "time" if (requested_period_sec is not None or training_period_sec is not None) else "frames"
+
+    if resolved_mode == "time":
+        sample_period_sec = requested_period_sec if requested_period_sec is not None else training_period_sec
+        if sample_period_sec is None:
+            sample_period_sec = nominal_period_sec
+        if sample_period_sec is None or sample_period_sec <= 0.0:
+            raise ValueError("Unable to resolve a positive time-based sampling period. Pass --sample_period_sec or use --sample_mode=frames.")
+    else:
+        sample_period_sec = nominal_period_sec
+
+    approx_step_frames = sample_every_n_frames
+    if resolved_mode == "time" and nominal_fps > 0 and sample_period_sec is not None:
+        approx_step_frames = max(int(round(float(sample_period_sec) * float(nominal_fps))), 1)
+
+    return {
+        "requested_mode": requested_mode,
+        "resolved_mode": resolved_mode,
+        "sample_every_n_frames": int(sample_every_n_frames),
+        "requested_sample_period_sec": requested_period_sec,
+        "training_sample_period_sec": training_period_sec,
+        "sample_period_sec": sample_period_sec,
+        "approx_step_frames": int(approx_step_frames),
+    }
+
+
+def should_sample_frame(
+    frame_idx: int,
+    frame_time_sec: float,
+    sampling_cfg: dict,
+    next_sample_time_sec: Optional[float],
+    has_sampled_before: bool,
+) -> Tuple[bool, Optional[float]]:
+    if sampling_cfg["resolved_mode"] == "frames":
+        step_frames = int(sampling_cfg["sample_every_n_frames"])
+        return bool(frame_idx % step_frames == 0), next_sample_time_sec
+
+    sample_period_sec = float(sampling_cfg["sample_period_sec"])
+    if not has_sampled_before:
+        return True, float(frame_time_sec) + sample_period_sec
+
+    if next_sample_time_sec is None:
+        next_sample_time_sec = float(frame_time_sec)
+
+    if float(frame_time_sec) + 1e-9 < float(next_sample_time_sec):
+        return False, float(next_sample_time_sec)
+
+    while float(frame_time_sec) + 1e-9 >= float(next_sample_time_sec):
+        next_sample_time_sec = float(next_sample_time_sec) + sample_period_sec
+    return True, float(next_sample_time_sec)
+
+
+def format_sampling_overlay(sampling_cfg: dict) -> str:
+    if sampling_cfg["resolved_mode"] == "time":
+        return f"sample={float(sampling_cfg['sample_period_sec']):.2f}s"
+    return f"sample={int(sampling_cfg['sample_every_n_frames'])}f"
 
 
 def interval_time_to_frame_bounds(
@@ -1310,9 +1420,11 @@ def main():
     ap.add_argument("--debug_csv", default=None, help="Optional sidecar CSV with one row per inference step, including scores, counts, and motion features.")
 
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--step", type=int, default=5)
+    ap.add_argument("--step", type=int, default=5, help="Frame-step used when --sample_mode=frames. Also used as a fallback nominal cadence when no time-based cadence can be resolved.")
+    ap.add_argument("--sample_mode", choices=["auto", "frames", "time"], default="auto", help="How to choose inference sample points. 'auto' prefers a real-time cadence from --sample_period_sec or the training config, then falls back to every --step frames.")
+    ap.add_argument("--sample_period_sec", type=float, default=None, help="Real-time sampling period in seconds. Used directly when --sample_mode=time, and by --sample_mode=auto when provided.")
     ap.add_argument("--conf", type=float, default=0.5)
-    ap.add_argument("--time_source", choices=["auto", "video", "nominal"], default="auto", help="How to assign timestamps to decoded frames. 'auto' prefers per-frame video timestamps and falls back to nominal fps.")
+    ap.add_argument("--time_source", choices=["auto", "video", "strict_video", "nominal"], default="auto", help="How to assign timestamps to decoded frames. 'auto' prefers per-frame video timestamps and falls back to nominal fps. 'strict_video' requires usable decoder timestamps and fails otherwise.")
 
     ap.add_argument("--K", type=int, default=25)
     ap.add_argument("--win", type=int, default=16)
@@ -1357,6 +1469,7 @@ def main():
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     nominal_fps = float(fps)
+    sampling_cfg = resolve_sampling_cfg(args, cfg, nominal_fps)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -1381,6 +1494,7 @@ def main():
     next_infer_idx = args.win - 1
     sample_idx = -1
     motion_idx = -1
+    next_sample_time_sec: Optional[float] = None
 
     last_p: Optional[float] = None
     last_state = False
@@ -1407,8 +1521,15 @@ def main():
         frame_time_records.append((frame_idx, float(frame_time_sec)))
         frame_time_source_counts[resolved_time_source] = frame_time_source_counts.get(resolved_time_source, 0) + 1
         did_infer = False
+        do_sample, next_sample_time_sec = should_sample_frame(
+            frame_idx=frame_idx,
+            frame_time_sec=float(frame_time_sec),
+            sampling_cfg=sampling_cfg,
+            next_sample_time_sec=next_sample_time_sec,
+            has_sampled_before=sample_idx >= 0,
+        )
 
-        if frame_idx % args.step == 0:
+        if do_sample:
             sample_idx += 1
             sample_t = float(frame_time_sec)
             n_H = H if H % 32 == 0 else H + (32 - (H%32))
@@ -1541,7 +1662,8 @@ def main():
 
         cv2.putText(frame, f"{txt2}  {txt1}  {txt3}", (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"{txt4}  frame={frame_idx} step={args.step} win={args.win} stride={args.stride}", (20, 70),
+        sampling_text = format_sampling_overlay(sampling_cfg)
+        cv2.putText(frame, f"{txt4}  frame={frame_idx} {sampling_text} win={args.win} stride={args.stride}", (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
         if txt5 is not None:
             cv2.putText(frame, txt5, (20, 105),
@@ -1552,8 +1674,10 @@ def main():
     cap.release()
     outv.release()
 
-    infer_dt_sec = estimate_time_step_sec(records, default=(float(args.step * args.stride) / float(nominal_fps) if nominal_fps > 0 else 0.0))
-    infer_span_frames = max(int(args.step * args.stride), 1)
+    resolved_sample_period_sec = sampling_cfg.get("sample_period_sec")
+    infer_dt_default = float(resolved_sample_period_sec * float(args.stride)) if resolved_sample_period_sec is not None else 0.0
+    infer_dt_sec = estimate_time_step_sec(records, default=infer_dt_default)
+    infer_span_frames = max(int(sampling_cfg.get("approx_step_frames", max(int(args.step), 1))) * int(args.stride), 1)
     attach_record_spans(records, default_span_sec=infer_dt_sec, default_span_frames=infer_span_frames)
     predicted_events_raw = build_intervals(
         records,
@@ -1616,6 +1740,12 @@ def main():
             "smooth_mode": str(args.smooth_mode),
             "state_threshold": float(args.thr_on),
             "time_source": str(args.time_source),
+            "sampling_mode_requested": str(sampling_cfg["requested_mode"]),
+            "sampling_mode_resolved": str(sampling_cfg["resolved_mode"]),
+            "sample_every_n_frames": int(sampling_cfg["sample_every_n_frames"]),
+            "sample_period_sec": float(sampling_cfg["sample_period_sec"]) if sampling_cfg.get("sample_period_sec") is not None else None,
+            "training_sample_period_sec": float(sampling_cfg["training_sample_period_sec"]) if sampling_cfg.get("training_sample_period_sec") is not None else None,
+            "approx_sample_step_frames": int(sampling_cfg["approx_step_frames"]),
             "resolved_time_sources": dict(frame_time_source_counts),
             "nominal_fps": float(nominal_fps),
             "video_duration_sec": float(video_duration_sec),

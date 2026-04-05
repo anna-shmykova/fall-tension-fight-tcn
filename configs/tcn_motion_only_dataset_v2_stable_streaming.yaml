@@ -1,0 +1,68 @@
+exp:
+  name: tcn_motion_only_dataset_v2_stable_streaming
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v2
+  runs_root: /home/anna/TCN_TRAIN/runs
+
+data:
+  label_mode: binary_tension
+  target_mode: last
+  window_size: 16
+  window_step: 4
+  fps: 25
+  sample_every_n_frames: 5
+  max_persons: 25
+
+  split:
+    mode: generate
+    seed: 42
+    val_ratio: 0.2
+
+window_labels:
+  rule: target
+  positive_overlap: 0.30
+
+labels:
+  mode: binary_tension
+  positive_event_id: 4
+
+features:
+  motion:
+    enabled: true
+    source: erez
+    align: prev
+    num_features: 21
+
+model:
+  type: motion_tcn
+  causal: true
+  norm: group
+  hidden_dim: 64
+  num_layers: 4
+  dilations: [1, 2, 4, 8]
+  kernel_size: 3
+  input_proj_dim: 32
+
+train:
+  batch_size: 32
+  epochs: 15
+  lr: 0.0005
+  weight_decay: 0.0001
+  pos_weight: 4.0
+  grad_clip: 1.0
+  early_stop_patience: 3
+  num_workers: 0
+  device: cuda
+  agg_mode: last
+  logsumexp_temperature: 1.0
+  end_loss_alpha: 0.2
+  end_loss_k: 2
+  save_all_checkpoints: true
+
+eval:
+  threshold_sweep:
+    start: 0.01
+    end: 0.99
+    step: 0.01

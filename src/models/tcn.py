@@ -24,6 +24,27 @@ def resolve_pool_mode(pool_mode="attn", use_attention_readout=None):
         raise ValueError(f"Unsupported pool_mode: {effective_pool_mode}")
     return effective_pool_mode
 
+
+def resolve_dilations(num_layers=3, dilations=None):
+    if dilations is None:
+        resolved = []
+        dilation = 1
+        for _ in range(int(num_layers)):
+            resolved.append(dilation)
+            dilation *= 2
+        return resolved
+
+    resolved = [int(dilation) for dilation in dilations]
+    if not resolved:
+        raise ValueError("dilations must contain at least one positive integer")
+    if any(dilation <= 0 for dilation in resolved):
+        raise ValueError(f"dilations must be positive, got {resolved}")
+
+    expected_layers = int(num_layers)
+    if expected_layers != len(resolved):
+        raise ValueError(f"num_layers={expected_layers} does not match len(dilations)={len(resolved)}")
+    return resolved
+
 class CausalConv1d(nn.Module):
     """Conv1d with left-only padding so output[t] depends only on input[:t]."""
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, bias=True):
@@ -86,6 +107,7 @@ class EventTCN(nn.Module):
                     num_classes=1,
                     hidden_dim=64,
                     num_layers=3,
+                    dilations=None,
                     kernel_size=3,
                     mlp_out_dim=32,
                     pool_mode="attn",
@@ -156,8 +178,7 @@ class EventTCN(nn.Module):
         in_ch = mlp_out_dim * pool_mult[self.pool_mode] + count_dim + (motion_out_dim if use_motion else 0)
 
         layers = []
-        dilation = 1
-        for _ in range(num_layers):
+        for dilation in resolve_dilations(num_layers=num_layers, dilations=dilations):
             layers.append(
                 TemporalConvBlock(
                     in_channels=in_ch,
@@ -169,7 +190,6 @@ class EventTCN(nn.Module):
                 )
             )
             in_ch = hidden_dim
-            dilation *= 2
 
         self.tcn = nn.Sequential(*layers)
         self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
@@ -213,6 +233,7 @@ class MotionTCN(nn.Module):
                     num_classes=1,
                     hidden_dim=64,
                     num_layers=4,
+                    dilations=None,
                     kernel_size=3,
                     causal=True,
                     norm="group",
@@ -230,8 +251,7 @@ class MotionTCN(nn.Module):
             in_ch = self.input_dim
 
         layers = []
-        dilation = 1
-        for _ in range(num_layers):
+        for dilation in resolve_dilations(num_layers=num_layers, dilations=dilations):
             layers.append(
                 TemporalConvBlock(
                     in_channels=in_ch,
@@ -243,7 +263,6 @@ class MotionTCN(nn.Module):
                 )
             )
             in_ch = hidden_dim
-            dilation *= 2
 
         self.tcn = nn.Sequential(*layers)
         self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)

@@ -37,7 +37,7 @@ def adapt_frames_for_erez(frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [adapt_frame_for_erez(frame) for frame in frames]
 
 
-def build_motion_sequence(frames, feature_cfg: Dict[str, Any] | None = None):
+def build_motion_sequence(frames, feature_cfg: Dict[str, Any] | None = None, label_cfg: Dict[str, Any] | None = None):
     feature_cfg = feature_cfg or {}
     j_version = float(feature_cfg.get("erez_json_version", 2.0))
     motion_dim = motion_feature_dim(feature_cfg)
@@ -54,7 +54,7 @@ def build_motion_sequence(frames, feature_cfg: Dict[str, Any] | None = None):
 
     # Motion feature x[t] describes the transition from frames[t] -> frames[t+1].
     # Align it with the later frame label so the sequence stays causal.
-    y_full = np.asarray([events_to_label(frame) for frame in frames], dtype=np.float32)
+    y_full = np.asarray([events_to_label(frame, cfg=label_cfg) for frame in frames], dtype=np.float32)
     y = y_full[1:]
 
     if X.shape[0] != y.shape[0]:

@@ -9,11 +9,11 @@ from src.data.features import (
 from src.data.labels import events_to_label
 
 
-def build_sequence(frames, K: int, feature_cfg=None):  # , label_cfg: dict):
+def build_sequence(frames, K: int, feature_cfg=None, label_cfg=None):
     X, Y = [], []
     for frame in frames:
         x_t = frame_to_vector(frame, K, cfg=feature_cfg)
-        y_t = events_to_label(frame)  # , label_cfg)
+        y_t = events_to_label(frame, cfg=label_cfg)
         X.append(x_t)
         Y.append(y_t)
 

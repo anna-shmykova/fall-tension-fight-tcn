@@ -12,6 +12,10 @@ data:
   window_step: 4
   split: fixed
 
+window_labels:
+  rule: train_like        # choices: train_like, target, any_overlap, overlap_frac
+  positive_overlap: 0.30  # used when rule=overlap_frac
+
 features:
   # match what your current frame_to_vector does
   use_bbox: true

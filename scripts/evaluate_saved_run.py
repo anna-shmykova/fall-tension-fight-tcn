@@ -16,10 +16,12 @@ import torch
 
 from src.data.dataset import EventJsonDataset, MotionJsonDataset
 from src.data.features import motion_feature_dim
+from src.data.labels import resolve_label_cfg
 from src.data.splits import read_paths_txt
 from src.models.tcn import EventTCN, MotionTCN
 from src.train import (
     build_dataset,
+    resolve_window_cfg,
     build_per_video_rows,
     evaluate_binary,
     evaluate_paths_individually,
@@ -63,6 +65,14 @@ def resolve_dataset_cls(cfg: dict[str, Any]):
     return MotionJsonDataset if model_type in {"motion_tcn", "erez_motion_tcn"} else EventJsonDataset
 
 
+def resolve_label_cfg_from_root(cfg: dict[str, Any]) -> dict[str, Any]:
+    label_cfg = dict(cfg.get("labels", {}) or {})
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if "mode" not in label_cfg and data_cfg.get("label_mode") is not None:
+        label_cfg["mode"] = data_cfg.get("label_mode")
+    return resolve_label_cfg(label_cfg)
+
+
 def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
     feature_cfg = cfg.get("features", {})
     model_cfg = cfg.get("model", {})
@@ -85,6 +95,7 @@ def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
             input_dim=input_dim,
             hidden_dim=int(model_cfg.get("hidden_dim", 64)),
             num_layers=int(model_cfg.get("num_layers", 4)),
+            dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),
@@ -95,6 +106,7 @@ def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
         input_dim=input_dim,
         hidden_dim=int(model_cfg.get("hidden_dim", 64)),
         num_layers=int(model_cfg.get("num_layers", 4)),
+        dilations=model_cfg.get("dilations"),
         kernel_size=int(model_cfg.get("kernel_size", 3)),
         mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
         pool_mode=str(model_cfg.get("pool_mode", "attn")),
@@ -146,9 +158,10 @@ def main() -> None:
     cfg = load_yaml(cfg_path)
     data_root = Path(cfg["paths"]["data_root"]).resolve()
     feature_cfg = cfg.get("features", {})
-    label_cfg = cfg.get("labels", {})
+    label_cfg = resolve_label_cfg_from_root(cfg)
     train_cfg = cfg.get("train", {})
     target_mode = str(cfg.get("data", {}).get("target_mode", "last")).lower()
+    window_cfg = resolve_window_cfg(cfg)
     K = int(cfg["data"].get("max_persons", 25))
     window_size = int(cfg["data"].get("window_size", 16))
     window_step = int(cfg["data"].get("window_step", 4))
@@ -176,6 +189,7 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
         verbose=False,
     )
@@ -188,6 +202,7 @@ def main() -> None:
             window_step=window_step,
             feature_cfg=feature_cfg,
             label_cfg=label_cfg,
+            window_cfg=window_cfg,
             target_mode=target_mode,
             verbose=False,
         )
@@ -209,6 +224,7 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
     )
     test_ds = build_dataset(
@@ -219,6 +235,7 @@ def main() -> None:
         window_step=window_step,
         feature_cfg=feature_cfg,
         label_cfg=label_cfg,
+        window_cfg=window_cfg,
         target_mode=target_mode,
     )
     if len(val_ds) == 0:

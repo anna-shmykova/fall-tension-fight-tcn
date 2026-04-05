@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_mlp_last_aggr_pool_motion_25_ALL_DS_loss_alpha_window_16_exclude_tens
+  name: tcn_causal_mlp_last_aggr_pool_motion_21_ALL_DS_usual_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:
@@ -24,9 +24,13 @@ data:
     group_key: "video_id"
     seed: 42
     val_ratio: 0.2
-    train_list: "fixed_splits/train_videos.txt"
-    val_list: #"fixed_splits/val_paths.txt"
-    test_list: "fixed_splits/test_videos.txt"
+    train_list: "fixed_splits/train_paths_all_ds.txt"
+    val_list: "fixed_splits/val_paths_all_ds.txt" #"fixed_splits/val_paths.txt"
+    test_list: #"fixed_splits/test_videos.txt"
+
+window_labels:
+  rule: target # train_like        # choices: train_like, target, any_overlap, overlap_frac
+  positive_overlap: 0.30  # used when rule=overlap_frac
 
 features:
   use_bbox: true
@@ -37,7 +41,7 @@ features:
     enabled: true
     source: erez
     align: prev       # prev avoids future leakage; next matches t->t+1 extraction
-    num_features: 25  # keep the first N motion features from analyze_json_motion.py
+    num_features: 21  # keep the first N motion features from analyze_json_motion.py
 
 model:
   type: "tcn"
@@ -58,18 +62,18 @@ model:
 
 train:
   batch_size: 32
-  epochs: 20
+  epochs: 15
   lr: 0.0005
   weight_decay: 0.0001
-  pos_weight: 1.0
+  pos_weight: 2.0
   grad_clip: 1.0
-  early_stop_patience: 5
+  early_stop_patience: 3
   num_workers: 0
   device: cuda
-  agg_mode: last #logsumexp          # or logmeanexp (recommended) last
+  agg_mode: last #last #logsumexp          # or logmeanexp (recommended) last
   logsumexp_temperature: 1.0
-  end_loss_alpha: 0.5 #0.5          # 0.0 disables
-  end_loss_k: 4                # last 4 steps = 0.8s at 5Hz
+  end_loss_alpha: 0.1 #0.5          # 0.0 disables
+  end_loss_k: 2                # last 4 steps = 0.8s at 5Hz
   save_all_checkpoints: true
   
 eval:
