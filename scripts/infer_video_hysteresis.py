@@ -815,6 +815,38 @@ def interval_iou(a: dict, b: dict) -> float:
     return float(overlap / union)
 
 
+def normalize_intervals(intervals: List[dict]) -> List[dict]:
+    return postprocess_intervals(intervals, merge_gap_sec=0.0, min_duration_sec=0.0)
+
+
+def total_interval_duration_sec(intervals: List[dict]) -> float:
+    normalized = normalize_intervals(intervals)
+    return float(sum(interval_duration_sec(interval) for interval in normalized))
+
+
+def total_overlap_between_interval_sets_sec(a_intervals: List[dict], b_intervals: List[dict]) -> float:
+    a_sorted = normalize_intervals(a_intervals)
+    b_sorted = normalize_intervals(b_intervals)
+    if not a_sorted or not b_sorted:
+        return 0.0
+
+    a_idx = 0
+    b_idx = 0
+    total_overlap_sec = 0.0
+
+    while a_idx < len(a_sorted) and b_idx < len(b_sorted):
+        a_item = a_sorted[a_idx]
+        b_item = b_sorted[b_idx]
+        total_overlap_sec += interval_overlap_sec(a_item, b_item)
+
+        if float(a_item["end_time_sec"]) <= float(b_item["end_time_sec"]):
+            a_idx += 1
+        else:
+            b_idx += 1
+
+    return float(total_overlap_sec)
+
+
 def postprocess_intervals(intervals: List[dict], merge_gap_sec: float = 0.0, min_duration_sec: float = 0.0) -> List[dict]:
     if not intervals:
         return []
@@ -903,6 +935,45 @@ def match_event_intervals(
     return matches, unmatched_gt, unmatched_pred
 
 
+def summarize_gt_fragmentation(
+    predicted_events: List[dict],
+    gt_events: List[dict],
+    min_overlap_sec: float = 0.0,
+) -> Tuple[List[int], List[dict]]:
+    min_overlap_sec = float(max(0.0, min_overlap_sec))
+    fragment_counts: List[int] = []
+    gt_fragment_details: List[dict] = []
+
+    for gt_idx, gt_event in enumerate(gt_events, start=1):
+        overlaps = []
+        for pred_idx, pred_event in enumerate(predicted_events, start=1):
+            overlap_sec = interval_overlap_sec(pred_event, gt_event)
+            if overlap_sec <= min_overlap_sec:
+                continue
+            overlaps.append(
+                {
+                    "pred_index": int(pred_idx),
+                    "overlap_sec": float(overlap_sec),
+                    "pred_start_time_sec": float(pred_event["start_time_sec"]),
+                    "pred_end_time_sec": float(pred_event["end_time_sec"]),
+                }
+            )
+
+        fragment_counts.append(len(overlaps))
+        gt_fragment_details.append(
+            {
+                "gt_index": int(gt_idx),
+                "gt_start_time_sec": float(gt_event["start_time_sec"]),
+                "gt_end_time_sec": float(gt_event["end_time_sec"]),
+                "n_fragments": int(len(overlaps)),
+                "matched_pred_indices": [int(item["pred_index"]) for item in overlaps],
+                "overlaps": overlaps,
+            }
+        )
+
+    return fragment_counts, gt_fragment_details
+
+
 def compute_event_stats(
     predicted_events: List[dict],
     gt_events: List[dict],
@@ -934,6 +1005,24 @@ def compute_event_stats(
     onset_delays = [float(match["onset_delay_sec"]) for match in matches]
     detection_delays = [float(match["detection_delay_sec"]) for match in matches]
     offset_errors = [float(match["offset_error_sec"]) for match in matches]
+    gt_fragment_counts, gt_fragment_details = summarize_gt_fragmentation(
+        predicted_events,
+        gt_events,
+        min_overlap_sec=min_overlap_sec,
+    )
+
+    total_gt_positive_sec = total_interval_duration_sec(gt_events)
+    total_pred_positive_sec = total_interval_duration_sec(predicted_events)
+    total_overlap_sec = total_overlap_between_interval_sets_sec(predicted_events, gt_events)
+    total_union_sec = max(total_gt_positive_sec + total_pred_positive_sec - total_overlap_sec, 0.0)
+
+    gt_hit_count = int(sum(count > 0 for count in gt_fragment_counts))
+    gt_hit_recall = float(gt_hit_count / len(gt_events)) if gt_events else 0.0
+    time_coverage = float(total_overlap_sec / total_gt_positive_sec) if total_gt_positive_sec > 0.0 else 0.0
+    time_iou = float(total_overlap_sec / total_union_sec) if total_union_sec > 0.0 else 0.0
+    mean_fragments_per_gt = _mean_or_none([float(count) for count in gt_fragment_counts])
+    median_fragments_per_gt = _median_or_none([float(count) for count in gt_fragment_counts])
+    max_fragments_per_gt = int(max(gt_fragment_counts)) if gt_fragment_counts else 0
 
     false_alarms_per_min = None
     if video_duration_sec > 0:
@@ -949,6 +1038,16 @@ def compute_event_stats(
         "recall": float(recall),
         "f1": float(f1),
         "false_alarms_per_min": false_alarms_per_min,
+        "gt_hit_count": int(gt_hit_count),
+        "gt_hit_recall": float(gt_hit_recall),
+        "total_gt_positive_sec": float(total_gt_positive_sec),
+        "total_pred_positive_sec": float(total_pred_positive_sec),
+        "total_overlap_sec": float(total_overlap_sec),
+        "time_coverage": float(time_coverage),
+        "time_iou": float(time_iou),
+        "mean_fragments_per_gt": mean_fragments_per_gt,
+        "median_fragments_per_gt": median_fragments_per_gt,
+        "max_fragments_per_gt": int(max_fragments_per_gt),
         "mean_iou": _mean_or_none(ious),
         "median_iou": _median_or_none(ious),
         "mean_gt_coverage": _mean_or_none(gt_coverages),
@@ -962,6 +1061,7 @@ def compute_event_stats(
         "matches": matches,
         "unmatched_gt_indices": unmatched_gt,
         "unmatched_pred_indices": unmatched_pred,
+        "gt_fragment_counts": gt_fragment_details,
         "min_match_overlap_sec": float(min_overlap_sec),
     }
 
@@ -1264,6 +1364,16 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
             "recall",
             "f1",
             "false_alarms_per_min",
+            "gt_hit_count",
+            "gt_hit_recall",
+            "total_gt_positive_sec",
+            "total_pred_positive_sec",
+            "total_overlap_sec",
+            "time_coverage",
+            "time_iou",
+            "mean_fragments_per_gt",
+            "median_fragments_per_gt",
+            "max_fragments_per_gt",
             "mean_iou",
             "median_iou",
             "mean_gt_coverage",
@@ -1306,6 +1416,18 @@ def write_events_report(events_path: Path, predicted_events: List[dict], gt_even
             lines.append("")
             lines.append("Unmatched predicted events:")
             lines.append(", ".join(f"Pred#{idx}" for idx in unmatched_pred))
+
+        gt_fragment_counts = event_stats.get("gt_fragment_counts", [])
+        if gt_fragment_counts:
+            lines.append("")
+            lines.append("GT fragment coverage:")
+            for item in gt_fragment_counts:
+                matched_pred_indices = item.get("matched_pred_indices", [])
+                matched_text = ",".join(f"Pred#{pred_idx}" for pred_idx in matched_pred_indices) if matched_pred_indices else "none"
+                lines.append(
+                    f"GT#{item['gt_index']}: fragments={item['n_fragments']} matched={matched_text} "
+                    f"({item['gt_start_time_sec']:.2f}s-{item['gt_end_time_sec']:.2f}s)"
+                )
 
     window_eval = stats.get("window_eval", {})
     if window_eval:
