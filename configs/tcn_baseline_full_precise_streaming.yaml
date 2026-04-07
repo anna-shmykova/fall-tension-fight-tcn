@@ -1,5 +1,5 @@
 exp:
-  name: tcn_event_graph_pool_motion_21_wind_8_dataset_v2_precise_streaming
+  name: tcn_event_pool_motion_21_soft_4_loss_wind_8_step_1_dataset_v2_precise_streaming
   seed: 42
 
 paths:
@@ -10,7 +10,7 @@ data:
   label_mode: binary_tension
   target_mode: last
   window_size: 8
-  window_step: 4
+  window_step: 1
   fps: 25
   sample_every_n_frames: 5
   max_persons: 25
@@ -23,8 +23,9 @@ data:
     val_list: "fixed_splits/val_paths.txt"
 
 window_labels:
-  rule: target
+  rule: soft_last_k #target
   positive_overlap: 0.30
+  soft_k: 4
 
 labels:
   mode: binary_tension
@@ -43,7 +44,7 @@ features:
 
 model:
   type: tcn
-  use_graph: true
+  use_graph: false
   use_attention_readout: false
   causal: true
   norm: group

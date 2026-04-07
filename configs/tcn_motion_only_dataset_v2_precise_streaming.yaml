@@ -25,6 +25,7 @@ data:
 window_labels:
   rule: target
   positive_overlap: 0.30
+  soft_k: 4
 
 labels:
   mode: binary_tension

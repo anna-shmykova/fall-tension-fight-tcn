@@ -29,8 +29,9 @@ data:
     test_list: #"fixed_splits/test_videos.txt"
 
 window_labels:
-  rule: target # train_like        # choices: train_like, target, any_overlap, overlap_frac
+  rule: target # train_like        # choices: train_like, target, any_overlap, overlap_frac, soft_last_k
   positive_overlap: 0.30  # used when rule=overlap_frac
+  soft_k: 4               # used when rule=soft_last_k
 
 features:
   use_bbox: true

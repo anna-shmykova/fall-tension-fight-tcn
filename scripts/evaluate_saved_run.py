@@ -21,6 +21,7 @@ from src.data.splits import read_paths_txt
 from src.models.tcn import EventTCN, MotionTCN
 from src.train import (
     build_dataset,
+    build_probability_calibration_report,
     resolve_window_cfg,
     build_per_video_rows,
     evaluate_binary,
@@ -28,10 +29,13 @@ from src.train import (
     fpr_from_stats,
     load_yaml,
     make_loader,
+    save_probability_calibration_artifacts,
     safe_float,
     summarize_video_scores,
 )
 from src.utils.metrics import (
+    apply_platt_scaling,
+    apply_temperature_scaling,
     compute_pr_points,
     compute_roc_points,
     confusion_stats_at_threshold,
@@ -259,12 +263,22 @@ def main() -> None:
     test_out = evaluate_binary(model, test_loader, device=device, agg_mode=agg_mode, temperature=temperature)
 
     selected_threshold = float(val_out["best_f1"]["threshold"])
-    test_targets = np.asarray(test_out["targets"], dtype=np.int32)
+    val_targets = np.asarray(val_out["targets"], dtype=np.float32)
+    val_logits = np.asarray(val_out["logits"], dtype=np.float32)
+    test_targets = np.asarray(test_out["targets"], dtype=np.float32)
+    test_binary_targets = np.asarray(test_out["binary_targets"], dtype=np.int32)
+    test_logits = np.asarray(test_out["logits"], dtype=np.float32)
     test_probs = np.asarray(test_out["probs"], dtype=np.float32)
-    selected_stats = confusion_stats_at_threshold(test_targets, test_probs, threshold=selected_threshold)
+    calibration_report = build_probability_calibration_report(
+        val_targets,
+        val_logits,
+        test_targets,
+        test_logits,
+    )
+    selected_stats = confusion_stats_at_threshold(test_binary_targets, test_probs, threshold=selected_threshold)
     oracle_stats = test_out["best_threshold_stats"]
-    roc_rows = compute_roc_points(test_targets, test_probs)
-    pr_rows = compute_pr_points(test_targets, test_probs)
+    roc_rows = compute_roc_points(test_binary_targets, test_probs)
+    pr_rows = compute_pr_points(test_binary_targets, test_probs)
 
     print(f"[INFO] Evaluating {len(val_paths)} validation files for video-level threshold selection")
     val_path_rows = evaluate_paths_individually(
@@ -323,8 +337,8 @@ def main() -> None:
 
     selected_fpr = fpr_from_stats(selected_stats)
     oracle_fpr = fpr_from_stats(oracle_stats)
-    n_pos = int(np.sum(test_targets == 1))
-    n_neg = int(np.sum(test_targets == 0))
+    n_pos = int(np.sum(test_binary_targets == 1))
+    n_neg = int(np.sum(test_binary_targets == 0))
 
     save_threshold_sweep_csv(output_dir, test_out["sweep"])
     save_rows_csv(output_dir / "per_file.csv", per_file_rows)
@@ -346,17 +360,74 @@ def main() -> None:
     )
     save_pr_curve_image(
         output_dir / "pr_curve_test.png",
-        y_true=test_targets.astype(np.float32),
+        y_true=test_binary_targets.astype(np.float32),
         y_prob=test_probs.astype(np.float32),
         title="Final Test Precision-Recall Curve",
     )
     save_roc_curve_image(
         output_dir / "roc_curve_test.png",
-        y_true=test_targets.astype(np.float32),
+        y_true=test_binary_targets.astype(np.float32),
         y_prob=test_probs.astype(np.float32),
         title="Final Test ROC Curve",
     )
+    save_probability_calibration_artifacts(
+        output_dir,
+        prefix="window_val_raw",
+        y_true=val_targets.astype(np.float32),
+        y_prob=np.asarray(val_out["probs"], dtype=np.float32),
+        title="Validation Reliability Diagram (Raw)",
+    )
+    save_probability_calibration_artifacts(
+        output_dir,
+        prefix="window_test_raw",
+        y_true=test_targets.astype(np.float32),
+        y_prob=test_probs.astype(np.float32),
+        title="Test Reliability Diagram (Raw)",
+    )
+    if calibration_report.get("temperature", {}).get("fit", {}).get("available"):
+        temp = float(calibration_report["temperature"]["fit"]["temperature"])
+        save_probability_calibration_artifacts(
+            output_dir,
+            prefix="window_val_temperature",
+            y_true=val_targets.astype(np.float32),
+            y_prob=apply_temperature_scaling(val_logits, temp),
+            title=f"Validation Reliability Diagram (Temperature T={temp:.3f})",
+        )
+        save_probability_calibration_artifacts(
+            output_dir,
+            prefix="window_test_temperature",
+            y_true=test_targets.astype(np.float32),
+            y_prob=apply_temperature_scaling(test_logits, temp),
+            title=f"Test Reliability Diagram (Temperature T={temp:.3f})",
+        )
+    if calibration_report.get("platt", {}).get("fit", {}).get("available"):
+        slope = float(calibration_report["platt"]["fit"]["slope"])
+        intercept = float(calibration_report["platt"]["fit"]["intercept"])
+        save_probability_calibration_artifacts(
+            output_dir,
+            prefix="window_val_platt",
+            y_true=val_targets.astype(np.float32),
+            y_prob=apply_platt_scaling(val_logits, slope=slope, intercept=intercept),
+            title="Validation Reliability Diagram (Platt)",
+        )
+        save_probability_calibration_artifacts(
+            output_dir,
+            prefix="window_test_platt",
+            y_true=test_targets.astype(np.float32),
+            y_prob=apply_platt_scaling(test_logits, slope=slope, intercept=intercept),
+            title="Test Reliability Diagram (Platt)",
+        )
+    (output_dir / "calibration.json").write_text(
+        json.dumps(calibration_report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
+    temperature_fit = calibration_report.get("temperature", {}).get("fit", {})
+    temperature_test = calibration_report.get("temperature", {}).get("test", {})
+    temperature_selected_stats = temperature_test.get("selected_threshold_stats", {})
+    platt_fit = calibration_report.get("platt", {}).get("fit", {})
+    platt_test = calibration_report.get("platt", {}).get("test", {})
+    platt_selected_stats = platt_test.get("selected_threshold_stats", {})
     summary_rows = [
         ("run_dir", str(run_dir)),
         ("checkpoint", str(ckpt_path)),
@@ -376,6 +447,11 @@ def main() -> None:
         ("test_n_neg", n_neg),
         ("test_auprc", safe_float(test_out["auprc"])),
         ("test_auroc", safe_float(test_out["auroc"])),
+        ("test_brier_score", safe_float(test_out["brier_score"])),
+        ("test_brier_baseline", safe_float(test_out["brier_baseline"])),
+        ("test_brier_skill_score", safe_float(test_out["brier_skill_score"])),
+        ("test_ece", safe_float(test_out["ece"])),
+        ("test_max_calibration_error", safe_float(test_out["max_calibration_error"])),
         ("window_selected_precision", safe_float(selected_stats["precision"])),
         ("window_selected_recall", safe_float(selected_stats["recall"])),
         ("window_selected_f1", safe_float(selected_stats["f1"])),
@@ -387,6 +463,27 @@ def main() -> None:
         ("window_oracle_f1", safe_float(oracle_stats["f1"])),
         ("window_oracle_accuracy", safe_float(oracle_stats["accuracy"])),
         ("window_oracle_fpr", oracle_fpr),
+        ("temperature_available", bool(temperature_fit.get("available", False))),
+        ("temperature_value", safe_float(temperature_fit.get("temperature", float("nan")))),
+        ("temperature_nll_before", safe_float(temperature_fit.get("nll_before", float("nan")))),
+        ("temperature_nll_after", safe_float(temperature_fit.get("nll_after", float("nan")))),
+        ("temperature_test_brier_score", safe_float(temperature_test.get("brier_score", float("nan")))),
+        ("temperature_test_ece", safe_float(temperature_test.get("ece", float("nan")))),
+        ("temperature_selected_threshold", safe_float(temperature_test.get("selected_threshold", float("nan")))),
+        ("temperature_selected_precision", safe_float(temperature_selected_stats.get("precision", float("nan")))),
+        ("temperature_selected_recall", safe_float(temperature_selected_stats.get("recall", float("nan")))),
+        ("temperature_selected_f1", safe_float(temperature_selected_stats.get("f1", float("nan")))),
+        ("platt_available", bool(platt_fit.get("available", False))),
+        ("platt_slope", safe_float(platt_fit.get("slope", float("nan")))),
+        ("platt_intercept", safe_float(platt_fit.get("intercept", float("nan")))),
+        ("platt_nll_before", safe_float(platt_fit.get("nll_before", float("nan")))),
+        ("platt_nll_after", safe_float(platt_fit.get("nll_after", float("nan")))),
+        ("platt_test_brier_score", safe_float(platt_test.get("brier_score", float("nan")))),
+        ("platt_test_ece", safe_float(platt_test.get("ece", float("nan")))),
+        ("platt_selected_threshold", safe_float(platt_test.get("selected_threshold", float("nan")))),
+        ("platt_selected_precision", safe_float(platt_selected_stats.get("precision", float("nan")))),
+        ("platt_selected_recall", safe_float(platt_selected_stats.get("recall", float("nan")))),
+        ("platt_selected_f1", safe_float(platt_selected_stats.get("f1", float("nan")))),
         ("video_mean_threshold_source", "validation_video_best_f1"),
         ("video_mean_selected_threshold", safe_float(test_video_mean["selected_threshold"])),
         ("video_mean_n_videos_eval", int(test_video_mean["n_videos_eval"])),
@@ -443,6 +540,13 @@ def main() -> None:
                 "auroc": safe_float(test_out["auroc"]),
                 "mean_prob_pos": safe_float(test_out["mean_prob_pos"]),
                 "mean_prob_neg": safe_float(test_out["mean_prob_neg"]),
+                "brier_score": safe_float(test_out["brier_score"]),
+                "brier_baseline": safe_float(test_out["brier_baseline"]),
+                "brier_skill_score": safe_float(test_out["brier_skill_score"]),
+                "ece": safe_float(test_out["ece"]),
+                "max_calibration_error": safe_float(test_out["max_calibration_error"]),
+                "calibration": test_out["calibration"],
+                "calibration_bins": test_out["calibration_bins"],
                 "selected_threshold": selected_threshold,
                 "selected_threshold_stats": {
                     **selected_stats,
@@ -466,6 +570,7 @@ def main() -> None:
                 "max_score": {key: value for key, value in test_video_max.items() if key != "sweep"},
             },
         },
+        "probability_calibration": calibration_report,
         "artifacts": {
             "summary_csv": str(output_dir / "summary.csv"),
             "per_file_csv": str(output_dir / "per_file.csv"),
@@ -473,6 +578,13 @@ def main() -> None:
             "roc_csv": str(output_dir / "roc.csv"),
             "pr_csv": str(output_dir / "pr.csv"),
             "threshold_sweep_csv": str(output_dir / "threshold_sweep.csv"),
+            "calibration_json": str(output_dir / "calibration.json"),
+            "window_test_raw_reliability": str(output_dir / "window_test_raw_reliability.png"),
+            "window_test_raw_calibration_bins": str(output_dir / "window_test_raw_calibration_bins.csv"),
+            "window_test_temperature_reliability": str(output_dir / "window_test_temperature_reliability.png"),
+            "window_test_temperature_calibration_bins": str(output_dir / "window_test_temperature_calibration_bins.csv"),
+            "window_test_platt_reliability": str(output_dir / "window_test_platt_reliability.png"),
+            "window_test_platt_calibration_bins": str(output_dir / "window_test_platt_calibration_bins.csv"),
         },
     }
     (output_dir / "metrics.json").write_text(
@@ -482,9 +594,16 @@ def main() -> None:
 
     print(
         f"[WINDOW TEST] AUPRC={test_out['auprc']:.4f} | AUROC={test_out['auroc']:.4f} "
+        f"| Brier={test_out['brier_score']:.4f} | ECE={test_out['ece']:.4f} "
         f"| val_thr={selected_threshold:.2f} F1={selected_stats['f1']:.4f} "
         f"| oracle_thr={float(test_out['best_f1']['threshold']):.2f} F1={oracle_stats['f1']:.4f}"
     )
+    if temperature_fit.get("available"):
+        print(
+            f"[WINDOW CAL] temperature={float(temperature_fit['temperature']):.4f} "
+            f"| test_brier={safe_float(temperature_test.get('brier_score', float('nan'))):.4f} "
+            f"| test_ece={safe_float(temperature_test.get('ece', float('nan'))):.4f}"
+        )
     print(
         f"[VIDEO TEST] mean_thr={float(test_video_mean['selected_threshold']):.2f} "
         f"F1={test_video_mean['selected_threshold_stats']['f1']:.4f} | "

@@ -1,7 +1,9 @@
-import numpy as np
 import csv
+import math
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+
+import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import precision_recall_curve, roc_curve, auc, roc_auc_score
 
@@ -44,6 +46,257 @@ def compute_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     if np.unique(y_true).size < 2:
         return float("nan")
     return float(roc_auc_score(y_true, y_prob))
+
+
+def sigmoid_from_logits(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    out = np.empty_like(logits, dtype=np.float64)
+    pos_mask = logits >= 0
+    out[pos_mask] = 1.0 / (1.0 + np.exp(-logits[pos_mask]))
+    exp_logits = np.exp(logits[~pos_mask])
+    out[~pos_mask] = exp_logits / (1.0 + exp_logits)
+    return out.astype(np.float32)
+
+
+def _binary_arrays(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    y_true_arr = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_prob_arr = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(y_true_arr) & np.isfinite(y_prob_arr)
+    y_true_arr = np.clip(y_true_arr[mask], 0.0, 1.0)
+    y_prob_arr = np.clip(y_prob_arr[mask], 0.0, 1.0)
+    return y_true_arr, y_prob_arr
+
+
+def compute_brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    y_true_arr, y_prob_arr = _binary_arrays(y_true, y_prob)
+    if y_true_arr.size == 0:
+        return float("nan")
+    return float(np.mean((y_prob_arr - y_true_arr) ** 2))
+
+
+def compute_calibration_bins(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+) -> List[Dict[str, float]]:
+    y_true_arr, y_prob_arr = _binary_arrays(y_true, y_prob)
+    n_bins = max(int(n_bins), 1)
+    if y_true_arr.size == 0:
+        return []
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob_arr, bin_edges[1:-1], right=False)
+    rows: List[Dict[str, float]] = []
+
+    for bin_idx in range(n_bins):
+        mask = bin_ids == bin_idx
+        count = int(np.sum(mask))
+        lower = float(bin_edges[bin_idx])
+        upper = float(bin_edges[bin_idx + 1])
+        center = float((lower + upper) / 2.0)
+
+        if count == 0:
+            rows.append(
+                {
+                    "bin": int(bin_idx),
+                    "lower": lower,
+                    "upper": upper,
+                    "center": center,
+                    "count": 0,
+                    "mean_confidence": float("nan"),
+                    "fraction_positive": float("nan"),
+                    "abs_gap": float("nan"),
+                }
+            )
+            continue
+
+        mean_confidence = float(np.mean(y_prob_arr[mask]))
+        fraction_positive = float(np.mean(y_true_arr[mask]))
+        rows.append(
+            {
+                "bin": int(bin_idx),
+                "lower": lower,
+                "upper": upper,
+                "center": center,
+                "count": count,
+                "mean_confidence": mean_confidence,
+                "fraction_positive": fraction_positive,
+                "abs_gap": float(abs(fraction_positive - mean_confidence)),
+            }
+        )
+
+    return rows
+
+
+def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
+    bins = compute_calibration_bins(y_true, y_prob, n_bins=n_bins)
+    total = sum(int(row["count"]) for row in bins)
+    if total == 0:
+        return float("nan")
+    return float(sum((int(row["count"]) / total) * float(row["abs_gap"]) for row in bins if int(row["count"]) > 0))
+
+
+def summarize_calibration(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> Dict[str, Any]:
+    y_true_arr, y_prob_arr = _binary_arrays(y_true, y_prob)
+    bins = compute_calibration_bins(y_true_arr, y_prob_arr, n_bins=n_bins)
+    total = int(y_true_arr.size)
+    n_pos = int(np.sum(y_true_arr > 0.0))
+    positive_rate = float(np.mean(y_true_arr)) if total > 0 else float("nan")
+    brier = compute_brier_score(y_true_arr, y_prob_arr)
+    brier_baseline = float(np.mean((positive_rate - y_true_arr) ** 2)) if total > 0 else float("nan")
+    brier_skill_score = float(1.0 - brier / brier_baseline) if brier_baseline > 0.0 else float("nan")
+    ece = compute_ece(y_true_arr, y_prob_arr, n_bins=n_bins)
+    populated_gaps = [float(row["abs_gap"]) for row in bins if int(row["count"]) > 0]
+
+    return {
+        "n_samples": total,
+        "n_bins": int(max(int(n_bins), 1)),
+        "n_pos": n_pos,
+        "n_neg": int(np.sum(y_true_arr <= 0.0)),
+        "positive_rate": positive_rate,
+        "brier_score": brier,
+        "brier_baseline": brier_baseline,
+        "brier_skill_score": brier_skill_score,
+        "ece": ece,
+        "max_calibration_error": float(max(populated_gaps)) if populated_gaps else float("nan"),
+        "bins": bins,
+    }
+
+
+def binary_nll_from_logits(y_true: np.ndarray, logits: np.ndarray) -> float:
+    y_true_arr = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    logits_arr = np.asarray(logits, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(y_true_arr) & np.isfinite(logits_arr)
+    y_true_arr = y_true_arr[mask]
+    logits_arr = logits_arr[mask]
+    if y_true_arr.size == 0:
+        return float("nan")
+    losses = np.maximum(logits_arr, 0.0) - logits_arr * y_true_arr + np.log1p(np.exp(-np.abs(logits_arr)))
+    return float(np.mean(losses))
+
+
+def apply_temperature_scaling(logits: np.ndarray, temperature: float) -> np.ndarray:
+    temperature = float(temperature)
+    if not np.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"temperature must be positive and finite, got {temperature!r}")
+    return sigmoid_from_logits(np.asarray(logits, dtype=np.float64) / temperature)
+
+
+def fit_temperature_scaling(
+    y_true: np.ndarray,
+    logits: np.ndarray,
+    min_temperature: float = 0.05,
+    max_temperature: float = 20.0,
+    n_iter: int = 80,
+) -> Dict[str, Any]:
+    y_true_arr = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    logits_arr = np.asarray(logits, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(y_true_arr) & np.isfinite(logits_arr)
+    y_true_arr = y_true_arr[mask]
+    logits_arr = logits_arr[mask]
+    if y_true_arr.size == 0 or np.unique(y_true_arr).size < 2:
+        return {
+            "method": "temperature",
+            "available": False,
+            "temperature": float("nan"),
+            "nll_before": binary_nll_from_logits(y_true_arr, logits_arr),
+            "nll_after": float("nan"),
+            "reason": "need at least one positive and one negative label",
+        }
+
+    lo = math.log(max(float(min_temperature), 1e-6))
+    hi = math.log(max(float(max_temperature), math.exp(lo) * 1.0001))
+    inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
+    inv_phi_sq = (3.0 - math.sqrt(5.0)) / 2.0
+
+    def objective(log_temperature: float) -> float:
+        temperature = math.exp(float(log_temperature))
+        return binary_nll_from_logits(y_true_arr, logits_arr / temperature)
+
+    h = hi - lo
+    c = lo + inv_phi_sq * h
+    d = lo + inv_phi * h
+    yc = objective(c)
+    yd = objective(d)
+
+    for _ in range(max(int(n_iter), 1)):
+        if yc < yd:
+            hi = d
+            d = c
+            yd = yc
+            h = inv_phi * h
+            c = lo + inv_phi_sq * h
+            yc = objective(c)
+        else:
+            lo = c
+            c = d
+            yc = yd
+            h = inv_phi * h
+            d = lo + inv_phi * h
+            yd = objective(d)
+
+    best_log_temperature = (lo + hi) / 2.0
+    temperature = float(math.exp(best_log_temperature))
+    return {
+        "method": "temperature",
+        "available": True,
+        "temperature": temperature,
+        "nll_before": binary_nll_from_logits(y_true_arr, logits_arr),
+        "nll_after": binary_nll_from_logits(y_true_arr, logits_arr / temperature),
+    }
+
+
+def apply_platt_scaling(logits: np.ndarray, slope: float, intercept: float) -> np.ndarray:
+    return sigmoid_from_logits(float(slope) * np.asarray(logits, dtype=np.float64) + float(intercept))
+
+
+def fit_platt_scaling(y_true: np.ndarray, logits: np.ndarray) -> Dict[str, Any]:
+    y_true_arr = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    logits_arr = np.asarray(logits, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(y_true_arr) & np.isfinite(logits_arr)
+    y_true_arr = y_true_arr[mask]
+    logits_arr = logits_arr[mask]
+    if y_true_arr.size > 0 and not np.all(np.isin(np.unique(y_true_arr), [0.0, 1.0])):
+        y_true_arr = (y_true_arr > 0.0).astype(np.int32)
+    if y_true_arr.size == 0 or np.unique(y_true_arr).size < 2:
+        return {
+            "method": "platt",
+            "available": False,
+            "slope": float("nan"),
+            "intercept": float("nan"),
+            "nll_before": binary_nll_from_logits(y_true_arr, logits_arr),
+            "nll_after": float("nan"),
+            "reason": "need at least one positive and one negative label",
+        }
+    y_true_arr = y_true_arr.astype(np.int32)
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+
+        clf = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
+        clf.fit(logits_arr.reshape(-1, 1), y_true_arr)
+    except Exception as exc:
+        return {
+            "method": "platt",
+            "available": False,
+            "slope": float("nan"),
+            "intercept": float("nan"),
+            "nll_before": binary_nll_from_logits(y_true_arr, logits_arr),
+            "nll_after": float("nan"),
+            "reason": str(exc),
+        }
+
+    slope = float(clf.coef_[0][0])
+    intercept = float(clf.intercept_[0])
+    calibrated_logits = slope * logits_arr + intercept
+    return {
+        "method": "platt",
+        "available": True,
+        "slope": slope,
+        "intercept": intercept,
+        "nll_before": binary_nll_from_logits(y_true_arr, logits_arr),
+        "nll_after": binary_nll_from_logits(y_true_arr, calibrated_logits),
+    }
 
 
 def compute_pr_points(y_true: np.ndarray, y_prob: np.ndarray) -> List[Dict[str, float]]:
@@ -349,3 +602,48 @@ def save_roc_curve_image(out_path: Path, y_true: np.ndarray, y_prob: np.ndarray,
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
+
+
+def save_reliability_diagram_image(
+    out_path: Path,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    title: str,
+    n_bins: int = 10,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary = summarize_calibration(y_true, y_prob, n_bins=n_bins)
+    bins = summary.get("bins", [])
+    populated = [row for row in bins if int(row["count"]) > 0]
+    if not populated:
+        return
+
+    mean_confidence = [float(row["mean_confidence"]) for row in populated]
+    fraction_positive = [float(row["fraction_positive"]) for row in populated]
+    centers = [float(row["center"]) for row in bins]
+    counts = [int(row["count"]) for row in bins]
+    n_bins = max(int(summary["n_bins"]), 1)
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="gray", label="perfect")
+    ax.plot(mean_confidence, fraction_positive, marker="o", linewidth=2.0, label="model")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed positive fraction")
+    ax.set_title(
+        f"{title}\nECE={summary['ece']:.4f} | Brier={summary['brier_score']:.4f} | n={summary['n_samples']}"
+    )
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True)
+    ax.legend(loc="upper left")
+
+    ax2 = ax.twinx()
+    ax2.bar(centers, counts, width=0.9 / n_bins, color="tab:gray", alpha=0.18)
+    ax2.set_ylabel("Bin count")
+    ax2.set_ylim(0.0, max(max(counts), 1) * 1.2)
+    ax.set_zorder(ax2.get_zorder() + 1)
+    ax.patch.set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)

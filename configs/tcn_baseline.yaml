@@ -13,8 +13,9 @@ data:
   split: fixed
 
 window_labels:
-  rule: train_like        # choices: train_like, target, any_overlap, overlap_frac
+  rule: train_like        # choices: train_like, target, any_overlap, overlap_frac, soft_last_k
   positive_overlap: 0.30  # used when rule=overlap_frac
+  soft_k: 4               # used when rule=soft_last_k
 
 features:
   # match what your current frame_to_vector does

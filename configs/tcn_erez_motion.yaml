@@ -22,6 +22,11 @@ data:
     train_list: "fixed_splits/train_paths.txt"
     val_list: "fixed_splits/val_paths.txt"
 
+window_labels:
+  rule: train_like        # choices: train_like, target, any_overlap, overlap_frac, soft_last_k
+  positive_overlap: 0.30  # used when rule=overlap_frac
+  soft_k: 4               # used when rule=soft_last_k
+
 features:
   type: erez_motion
   erez_json_version: 2.0

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 
-WINDOW_LABEL_RULES = {"train_like", "target", "any_overlap", "overlap_frac"}
+WINDOW_LABEL_RULES = {"train_like", "target", "any_overlap", "overlap_frac", "soft_last_k"}
 
 
 def resolve_target_index(window_size: int, target_mode: str) -> int:
@@ -28,7 +28,11 @@ def resolve_window_label_cfg(window_cfg=None):
     if not (0.0 <= positive_overlap <= 1.0):
         raise ValueError(f"window positive overlap must be in [0, 1], got {positive_overlap}")
 
-    return {"rule": rule, "positive_overlap": positive_overlap}
+    soft_k = int(cfg.get("soft_k", cfg.get("soft_last_k", 4)))
+    if soft_k < 1:
+        raise ValueError(f"window soft_k must be >= 1, got {soft_k}")
+
+    return {"rule": rule, "positive_overlap": positive_overlap, "soft_k": soft_k}
 
 
 def label_window(y_win: np.ndarray, target_index: int, window_cfg=None):
@@ -52,6 +56,10 @@ def label_window(y_win: np.ndarray, target_index: int, window_cfg=None):
         return int(has_any_pos)
     if rule == "overlap_frac":
         return int(positive_fraction >= float(cfg["positive_overlap"]))
+    if rule == "soft_last_k":
+        k = int(min(max(int(cfg["soft_k"]), 1), target_index + 1))
+        start = int(target_index - k + 1)
+        return float(np.mean(y_win[start : target_index + 1] == 1))
     raise ValueError(f"Unsupported window label rule: {rule}")
 
 
@@ -97,7 +105,7 @@ class _BaseWindowDataset(Dataset):
                 y_label = label_window(y_win, target_index=self.target_index, window_cfg=self.window_cfg)
                 if y_label is None:
                     continue
-                self.samples.append((X_win, int(y_label)))
+                self.samples.append((X_win, float(y_label)))
 
             if self.verbose and (index == total_paths or index % report_every == 0):
                 print(
@@ -118,7 +126,7 @@ class _BaseWindowDataset(Dataset):
     def __getitem__(self, idx):
         X_win, y_label = self.samples[idx]
         X_win = torch.from_numpy(X_win)
-        y_label = torch.tensor(y_label)
+        y_label = torch.tensor(y_label, dtype=torch.float32)
         return X_win, y_label
 
 
