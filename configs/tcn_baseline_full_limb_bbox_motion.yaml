@@ -1,0 +1,94 @@
+exp:
+  name: tcn_causal_motion_42_wind_8_step_1_limb_bbox_dataset_v2
+  seed: 42
+
+paths:
+  data_root: /home/anna/TCN_TRAIN/datasets/dataset_v2
+  runs_root: /home/anna/TCN_TRAIN/runs
+
+data:
+  label_mode: "binary_tension"
+  target_mode: last
+  window_size: 8
+  window_step: 1
+  fps: 25
+  sample_every_n_frames: 5
+  max_persons: 25
+
+  det_conf_keep: 0.6
+  kp_conf_keep: 0.3
+
+  split:
+    mode: fixed # generate
+    group_key: "video_id"
+    seed: 42
+    val_ratio: 0.2
+    train_list: "fixed_splits/train_paths.txt"
+    val_list: "fixed_splits/val_paths.txt"
+    test_list: "fixed_splits/test_files_hospital.txt"
+
+window_labels:
+  rule: target
+  positive_overlap: 0.30
+  soft_k: 4
+
+features:
+  use_bbox: true
+  use_keypoints: false
+  use_quality_gates: true
+  normalize: "bbox"
+  motion:
+    enabled: true
+    source: erez
+    align: prev
+    # 1-25 are the original Erez motion/overlap features.
+    # 26-42 add bbox proximity, upper/lower limb motion, wrist-to-other-person proximity,
+    # and bbox-match reliability/ambiguity features.
+    num_features: 42
+    kp_min_conf: 0.3
+    match_min_iou: 0.2
+    match_max_center_dist: 0.15
+    match_max_size_ratio: 2.5
+    match_ambiguity_margin: 0.03
+    close_pair_dist_thresh: 0.15
+    wrist_near_bbox_thresh: 0.08
+    missing_pair_dist: 1.0
+
+model:
+  type: "motion_tcn"
+  use_graph: false
+  use_attention_readout: false
+  causal: true
+  norm: group
+  hidden_dim: 64
+  num_layers: 4
+  dilations: [1, 2, 4, 8]
+  kernel_size: 3
+  dropout: 0.2
+  mlp_out_dim: 32
+  pool_mode: mean_max_std
+  tcn_input_mode: pooled_count_motion
+  use_person_count: true
+  motion_proj_dim: 32
+
+train:
+  batch_size: 32
+  epochs: 15
+  lr: 0.0005
+  weight_decay: 0.0001
+  pos_weight: 2.0
+  grad_clip: 1.0
+  early_stop_patience: 3
+  num_workers: 0
+  device: cuda
+  agg_mode: last
+  logsumexp_temperature: 1.0
+  end_loss_alpha: 0.1
+  end_loss_k: 2
+  save_all_checkpoints: true
+
+eval:
+  threshold_sweep:
+    start: 0.01
+    end: 0.99
+    step: 0.01

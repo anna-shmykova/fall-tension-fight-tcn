@@ -4,7 +4,12 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from src.data.features import motion_feature_dim, select_motion_features
+from src.data.features import (
+    EREZ_BASE_MOTION_DIM,
+    motion_extractor_kwargs,
+    motion_feature_dim,
+    select_motion_features,
+)
 from src.data.labels import events_to_label
 from src.erez_files.analyze_json_motion import extract_motion_features
 
@@ -49,7 +54,12 @@ def build_motion_sequence(frames, feature_cfg: Dict[str, Any] | None = None, lab
         )
 
     frames_erez = adapt_frames_for_erez(frames)
-    X = extract_motion_features(frames_erez, j_version=j_version).astype(np.float32)
+    X = extract_motion_features(
+        frames_erez,
+        j_version=j_version,
+        extended=(motion_dim > EREZ_BASE_MOTION_DIM),
+        **motion_extractor_kwargs(feature_cfg),
+    ).astype(np.float32)
     X = select_motion_features(X, target_dim=motion_dim)
 
     # Motion feature x[t] describes the transition from frames[t] -> frames[t+1].

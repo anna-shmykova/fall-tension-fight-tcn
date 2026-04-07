@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from src.data.features import EREZ_MOTION_DIM
+from src.data.features import EREZ_BASE_MOTION_DIM, EREZ_MOTION_DIM
 from src.data.motion_sequence import adapt_frame_for_erez
 from src.erez_files.analyze_json_motion import extract_motion_features
 from src.models.tcn import MotionTCN
@@ -175,6 +175,7 @@ def main():
     device = torch.device(args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu")
     yolo = YOLO(args.yolo_pose)
     model = load_motion_model(args.ckpt, device=device)
+    model_input_dim = int(getattr(model, "input_dim", EREZ_BASE_MOTION_DIM))
     hyst = Hysteresis(HystCfg(args.thr_on, args.thr_off, args.k_on, args.k_off, args.N))
 
     cap = cv2.VideoCapture(args.video_in)
@@ -228,7 +229,12 @@ def main():
                 motion_vec = extract_motion_features(
                     [prev_frame_erez, frame_curr_erez],
                     j_version=float(args.erez_json_version),
+                    extended=(model_input_dim > EREZ_BASE_MOTION_DIM),
                 )[0].astype(np.float32)
+                if motion_vec.shape[0] > model_input_dim:
+                    motion_vec = motion_vec[:model_input_dim]
+                elif motion_vec.shape[0] < model_input_dim:
+                    motion_vec = np.pad(motion_vec, (0, model_input_dim - motion_vec.shape[0]))
                 motion_buf.append(motion_vec)
                 motion_idx += 1
 

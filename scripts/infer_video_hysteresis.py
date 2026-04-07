@@ -17,9 +17,11 @@ from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 from ultralytics import YOLO
 
 from src.data.features import (
+    EREZ_BASE_MOTION_DIM,
     EREZ_MOTION_DIM,
     extract_erez_motion_features,
     frame_to_vector,
+    motion_extractor_kwargs,
     motion_feature_cfg,
     motion_feature_dim,
 )
@@ -1577,6 +1579,7 @@ def main():
     ckpt_path, payload, cfg = resolve_model_artifacts(args)
     model, model_type, feature_cfg = load_model_from_payload(payload, cfg, args, device=device)
     motion_cfg = motion_feature_cfg(feature_cfg)
+    motion_kwargs = motion_extractor_kwargs(feature_cfg)
     if model_type in MOTION_ONLY_MODEL_TYPES:
         motion_dim = int(getattr(model, "input_dim", EREZ_MOTION_DIM))
     else:
@@ -1674,6 +1677,8 @@ def main():
                         [prev_sample_frame, frame_payload],
                         align=motion_cfg.get("align", "prev"),
                         j_version=feature_cfg.get("erez_json_version", 2.0),
+                        extended=(motion_dim > EREZ_BASE_MOTION_DIM),
+                        **motion_kwargs,
                     )[-1]
                     motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
                     current_motion_vec = motion_vec.astype(np.float32, copy=False)
@@ -1715,6 +1720,8 @@ def main():
                             [prev_sample_frame, frame_payload],
                             align=motion_cfg.get("align", "prev"),
                             j_version=feature_cfg.get("erez_json_version", 2.0),
+                            extended=(motion_dim > EREZ_BASE_MOTION_DIM),
+                            **motion_kwargs,
                         )[-1]
                         motion_vec = align_motion_vector_dim(motion_vec, motion_dim)
                     current_motion_vec = motion_vec.astype(np.float32, copy=False)

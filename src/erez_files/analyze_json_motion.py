@@ -1,7 +1,8 @@
 """     Extract order-free motion features from JSON frame sequences.
     This file converts per-frame detections/keypoints into a clip-level motion
     representation. The main entry point is `extract_motion_features(...)`, which
-    builds one 25-dim feature vector for each pair of consecutive frames.
+    builds one 25-dim feature vector for each pair of consecutive frames by default,
+    or 42 dims when extended=True.
     Feature order:
     1.  d_mean_center_x      : change in mean bbox center (x,y); global  crowd motion
     2.  d_mean_center_y      :
@@ -30,12 +31,46 @@
     23. mean_pairwise_iou    : mean pairwise bbox IoU in frame t+1
     24. max_pairwise_iou     : max pairwise bbox IoU in frame t+1
     25. overlap_ratio        : redundant bbox overlap ratio in frame t+1
+    * Optional extended features, enabled with extract_motion_features(..., extended=True)
+    26. min_pairwise_bbox_dist         : nearest bbox-center distance in frame t+1
+    27. d_min_pairwise_bbox_dist       : change in nearest bbox-center distance; negative means closing
+    28. close_pair_ratio               : fraction of bbox-center pairs closer than a threshold in frame t+1
+    29. d_close_pair_ratio             : change in close_pair_ratio
+    30. wrist_rel_motion_mean          : matched wrist motion after subtracting bbox-center motion
+    31. wrist_rel_motion_p90           : robust high wrist relative motion
+    32. elbow_rel_motion_mean          : matched elbow motion after subtracting bbox-center motion
+    33. upper_limb_rel_motion_energy   : matched shoulder/elbow/wrist relative motion mean
+    34. upper_limb_visibility_ratio    : visible/confident upper-limb keypoint ratio in frame t+1
+    35. lower_limb_rel_motion_mean     : matched hip/knee/ankle relative motion mean
+    36. lower_limb_visibility_ratio    : visible/confident lower-limb keypoint ratio in frame t+1
+    37. matched_person_ratio           : accepted bbox-based matches from t to t+1
+    38. ambiguous_match_ratio          : rejected ambiguous source-person matches
+    39. wrist_to_other_bbox_dist_min   : closest visible wrist to another person's bbox in frame t+1
+    40. wrist_near_other_bbox_ratio    : fraction of visible wrists close to another person's bbox
+    41. upper_limb_overlap_motion      : upper_limb_rel_motion_energy weighted by bbox overlap
+    42. match_quality_mean             : mean accepted bbox-match quality
 """
 
 import numpy as np
 
 N_Keypoints = 17
 DEFAULT_VERSION = 2.0
+BASE_MOTION_FEATURE_DIM = 25
+EXTENDED_MOTION_FEATURE_DIM = 42
+
+WRIST_KP = (9, 10)
+ELBOW_KP = (7, 8)
+UPPER_LIMB_KP = (5, 6, 7, 8, 9, 10)
+LOWER_LIMB_KP = (11, 12, 13, 14, 15, 16)
+
+DEFAULT_KP_CONF_MIN = 0.3
+DEFAULT_MATCH_MIN_IOU = 0.2
+DEFAULT_MATCH_MAX_CENTER_DIST = 0.15
+DEFAULT_MATCH_MAX_SIZE_RATIO = 2.5
+DEFAULT_MATCH_AMBIGUITY_MARGIN = 0.03
+DEFAULT_CLOSE_PAIR_DIST_THRESH = 0.15
+DEFAULT_WRIST_NEAR_BBOX_THRESH = 0.08
+DEFAULT_MISSING_PAIR_DIST = 1.0
 
 # --------------------------------------------------
 # * public fucntion, to be used by other units
@@ -44,13 +79,17 @@ DEFAULT_VERSION = 2.0
 def extract_motion_features(frames, j_version:float=DEFAULT_VERSION, **kwargs):
     """Convert frames into a T x C motion sequence.
     Kwargs:
+        extended: if True, append upper-limb and bbox interaction features (42 dims total).
         pure_motion: if True, drop the static overlap features (22-25).
         legacy: if True, return only the original 18 features.
     """
     frame_feats = []
     raw_points = []
+    raw_persons = []
 
     kp_conf = True if j_version >= 2.0 else False
+    vec_kp = 3 if kp_conf else 2
+    extended = bool(kwargs.get('extended', kwargs.get('include_extended', False)))
 
     for frm in frames:
         if len(frm['detections_list']) > 0:
@@ -60,6 +99,12 @@ def extract_motion_features(frames, j_version:float=DEFAULT_VERSION, **kwargs):
         agg = frame_aggregates(bb_centers, bb_sizes, keypoints, bboxes)
         frame_feats.append(agg)
         raw_points.append((bb_centers, keypoints))
+        if extended:
+            raw_persons.append(extract_person_geometry(
+                frm,
+                vec_kp=vec_kp,
+                kp_min_conf=kwargs.get('kp_min_conf', DEFAULT_KP_CONF_MIN),
+            ))
 
     frame_feats = np.stack(frame_feats)  #* TxC
 
@@ -82,6 +127,11 @@ def extract_motion_features(frames, j_version:float=DEFAULT_VERSION, **kwargs):
                                     curr_agg[14:17],    #* union_coverage, mean_pairwise_iou, max_pairwise_iou
                                     curr_agg[17:18],    #* overlap_ratio
                                      ])
+        if extended:
+            motion_vec = np.concatenate([
+                motion_vec,
+                extended_limb_bbox_motion_features(raw_persons[t], raw_persons[t + 1], curr_agg, **kwargs),
+            ])
         motion_feats.append(motion_vec)
 
     motion_feats = np.stack(motion_feats)
@@ -293,6 +343,285 @@ def nearest_neighbor_motion(A, B):
 
     dists = np.asarray(dists)
     return float(dists.mean()), float(dists.max())
+
+
+def extract_person_geometry(frame, vec_kp=3, kp_min_conf=DEFAULT_KP_CONF_MIN):
+    """Return per-detection geometry with confidence-gated keypoints."""
+    persons = []
+    kp_min_conf = float(kp_min_conf)
+
+    for det in frame.get('detections_list', []):
+        bbox = det.get('bbox', [])
+        if len(bbox) != 4:
+            continue
+
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        w, h = (x2 - x1), (y2 - y1)
+        if w <= 0 or h <= 0:
+            continue
+
+        kps = det.get('key_pts', [])
+        kps_xy = np.full((N_Keypoints, 2), np.nan, dtype=np.float32)
+        kps_conf = np.zeros((N_Keypoints,), dtype=np.float32)
+        kps_valid = np.zeros((N_Keypoints,), dtype=bool)
+
+        for kp_idx in range(N_Keypoints):
+            base = kp_idx * vec_kp
+            if base + 1 >= len(kps):
+                break
+
+            x = float(kps[base])
+            y = float(kps[base + 1])
+            conf = float(kps[base + 2]) if vec_kp >= 3 and base + 2 < len(kps) else 1.0
+            visible = not (x == 0.0 and y == 0.0)
+            valid = visible and conf >= kp_min_conf
+
+            if valid:
+                kps_xy[kp_idx] = [x, y]
+            kps_conf[kp_idx] = conf
+            kps_valid[kp_idx] = valid
+
+        persons.append({
+            'bbox': np.asarray([x1, y1, x2, y2], dtype=np.float32),
+            'center': np.asarray([(x1 + x2) / 2, (y1 + y2) / 2], dtype=np.float32),
+            'size': np.asarray([w, h], dtype=np.float32),
+            'keypoints': kps_xy,
+            'kp_conf': kps_conf,
+            'kp_valid': kps_valid,
+        })
+
+    return persons
+
+
+def _safe_mean(values):
+    if len(values) == 0:
+        return 0.0
+    return float(np.asarray(values, dtype=np.float32).mean())
+
+
+def _safe_percentile(values, q):
+    if len(values) == 0:
+        return 0.0
+    return float(np.percentile(np.asarray(values, dtype=np.float32), q))
+
+
+def _bbox_iou(box_a, box_b):
+    x1 = max(float(box_a[0]), float(box_b[0]))
+    y1 = max(float(box_a[1]), float(box_b[1]))
+    x2 = min(float(box_a[2]), float(box_b[2]))
+    y2 = min(float(box_a[3]), float(box_b[3]))
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, float(box_a[2] - box_a[0])) * max(0.0, float(box_a[3] - box_a[1]))
+    area_b = max(0.0, float(box_b[2] - box_b[0])) * max(0.0, float(box_b[3] - box_b[1]))
+    union = area_a + area_b - inter
+    return 0.0 if union <= 0 else float(inter / union)
+
+
+def _bbox_size_log_delta(prev_person, curr_person, eps=1e-6):
+    prev_size = np.maximum(prev_person['size'].astype(np.float64), eps)
+    curr_size = np.maximum(curr_person['size'].astype(np.float64), eps)
+    return float(np.max(np.abs(np.log(curr_size / prev_size))))
+
+
+def _pairwise_center_distances(persons):
+    if len(persons) < 2:
+        return np.zeros((0,), dtype=np.float32)
+
+    centers = np.stack([p['center'] for p in persons]).astype(np.float32)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.linalg.norm(diffs, axis=-1)
+    iu = np.triu_indices(len(persons), k=1)
+    return dists[iu].astype(np.float32)
+
+
+def _bbox_proximity_features(persons, close_dist_thresh, missing_pair_dist):
+    dists = _pairwise_center_distances(persons)
+    if len(dists) == 0:
+        return float(missing_pair_dist), 0.0
+
+    return float(dists.min()), float(np.mean(dists <= close_dist_thresh))
+
+
+def _match_persons_by_bbox(prev_persons, curr_persons, **kwargs):
+    if len(prev_persons) == 0 or len(curr_persons) == 0:
+        return [], 0.0, 0.0, 0.0
+
+    min_iou = float(kwargs.get('match_min_iou', DEFAULT_MATCH_MIN_IOU))
+    max_center_dist = float(kwargs.get('match_max_center_dist', DEFAULT_MATCH_MAX_CENTER_DIST))
+    max_size_ratio = float(kwargs.get('match_max_size_ratio', DEFAULT_MATCH_MAX_SIZE_RATIO))
+    max_size_delta = float(np.log(max(max_size_ratio, 1.0 + 1e-6)))
+    ambiguity_margin = float(kwargs.get('match_ambiguity_margin', DEFAULT_MATCH_AMBIGUITY_MARGIN))
+    iou_weight = float(kwargs.get('match_iou_weight', 0.25))
+    size_weight = float(kwargs.get('match_size_weight', 0.05))
+
+    candidates = []
+    ambiguous_sources = 0
+
+    for i, prev_person in enumerate(prev_persons):
+        row = []
+        for j, curr_person in enumerate(curr_persons):
+            center_dist = float(np.linalg.norm(curr_person['center'] - prev_person['center']))
+            iou = _bbox_iou(prev_person['bbox'], curr_person['bbox'])
+            size_delta = _bbox_size_log_delta(prev_person, curr_person)
+            valid = (iou >= min_iou or center_dist <= max_center_dist) and size_delta <= max_size_delta
+            if not valid:
+                continue
+
+            cost = center_dist + iou_weight * (1.0 - iou) + size_weight * size_delta
+            row.append((cost, j, iou, center_dist, size_delta))
+
+        if not row:
+            continue
+
+        row.sort(key=lambda item: item[0])
+        is_ambiguous = len(row) > 1 and (row[1][0] - row[0][0]) < ambiguity_margin
+        if is_ambiguous:
+            ambiguous_sources += 1
+            continue
+
+        cost, j, iou, center_dist, size_delta = row[0]
+        candidates.append((cost, i, j, iou, center_dist, size_delta))
+
+    candidates.sort(key=lambda item: item[0])
+    matches = []
+    used_prev = set()
+    used_curr = set()
+    qualities = []
+
+    for cost, i, j, iou, center_dist, size_delta in candidates:
+        if i in used_prev or j in used_curr:
+            continue
+
+        used_prev.add(i)
+        used_curr.add(j)
+        quality = 1.0 / (1.0 + float(cost))
+        matches.append((i, j, quality))
+        qualities.append(quality)
+
+    denom = max(len(prev_persons), 1)
+    matched_ratio = len(matches) / denom
+    ambiguous_ratio = ambiguous_sources / denom
+    match_quality_mean = _safe_mean(qualities)
+
+    return matches, matched_ratio, ambiguous_ratio, match_quality_mean
+
+
+def _relative_keypoint_motion(prev_persons, curr_persons, matches, kp_indices):
+    values = []
+
+    for prev_idx, curr_idx, _quality in matches:
+        prev_person = prev_persons[prev_idx]
+        curr_person = curr_persons[curr_idx]
+        body_delta = curr_person['center'] - prev_person['center']
+
+        for kp_idx in kp_indices:
+            if prev_person['kp_valid'][kp_idx] and curr_person['kp_valid'][kp_idx]:
+                kp_delta = curr_person['keypoints'][kp_idx] - prev_person['keypoints'][kp_idx]
+                values.append(float(np.linalg.norm(kp_delta - body_delta)))
+
+    return values
+
+
+def _keypoint_visibility_ratio(persons, kp_indices):
+    denom = len(persons) * len(kp_indices)
+    if denom == 0:
+        return 0.0
+
+    visible = 0
+    for person in persons:
+        visible += int(np.sum(person['kp_valid'][list(kp_indices)]))
+    return float(visible / denom)
+
+
+def _point_to_bbox_distance(point, bbox):
+    x, y = float(point[0]), float(point[1])
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    dx = max(x1 - x, 0.0, x - x2)
+    dy = max(y1 - y, 0.0, y - y2)
+    return float(np.hypot(dx, dy))
+
+
+def _wrist_to_other_bbox_features(persons, near_thresh, missing_pair_dist):
+    distances = []
+
+    for person_idx, person in enumerate(persons):
+        for kp_idx in WRIST_KP:
+            if not person['kp_valid'][kp_idx]:
+                continue
+
+            wrist = person['keypoints'][kp_idx]
+            for other_idx, other in enumerate(persons):
+                if other_idx == person_idx:
+                    continue
+                distances.append(_point_to_bbox_distance(wrist, other['bbox']))
+
+    if len(distances) == 0:
+        return float(missing_pair_dist), 0.0
+
+    distances = np.asarray(distances, dtype=np.float32)
+    return float(distances.min()), float(np.mean(distances <= near_thresh))
+
+
+def extended_limb_bbox_motion_features(prev_persons, curr_persons, curr_agg, **kwargs):
+    """Extra robust features after the original 25 Erez motion dimensions."""
+    close_dist_thresh = float(kwargs.get('close_pair_dist_thresh', DEFAULT_CLOSE_PAIR_DIST_THRESH))
+    wrist_near_thresh = float(kwargs.get('wrist_near_bbox_thresh', DEFAULT_WRIST_NEAR_BBOX_THRESH))
+    missing_pair_dist = float(kwargs.get('missing_pair_dist', DEFAULT_MISSING_PAIR_DIST))
+
+    prev_min_dist, prev_close_ratio = _bbox_proximity_features(
+        prev_persons,
+        close_dist_thresh=close_dist_thresh,
+        missing_pair_dist=missing_pair_dist,
+    )
+    curr_min_dist, curr_close_ratio = _bbox_proximity_features(
+        curr_persons,
+        close_dist_thresh=close_dist_thresh,
+        missing_pair_dist=missing_pair_dist,
+    )
+
+    matches, matched_ratio, ambiguous_ratio, match_quality_mean = _match_persons_by_bbox(
+        prev_persons,
+        curr_persons,
+        **kwargs,
+    )
+
+    wrist_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, WRIST_KP)
+    elbow_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, ELBOW_KP)
+    upper_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, UPPER_LIMB_KP)
+    lower_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, LOWER_LIMB_KP)
+
+    upper_energy = _safe_mean(upper_motion)
+    upper_visibility = _keypoint_visibility_ratio(curr_persons, UPPER_LIMB_KP)
+    lower_visibility = _keypoint_visibility_ratio(curr_persons, LOWER_LIMB_KP)
+    wrist_other_min_dist, wrist_near_other_ratio = _wrist_to_other_bbox_features(
+        curr_persons,
+        near_thresh=wrist_near_thresh,
+        missing_pair_dist=missing_pair_dist,
+    )
+
+    max_pairwise_iou = float(curr_agg[16]) if len(curr_agg) > 16 else 0.0
+    overlap_ratio = float(curr_agg[17]) if len(curr_agg) > 17 else 0.0
+    overlap_score = max(max_pairwise_iou, overlap_ratio)
+
+    return np.asarray([
+        curr_min_dist,
+        curr_min_dist - prev_min_dist,
+        curr_close_ratio,
+        curr_close_ratio - prev_close_ratio,
+        _safe_mean(wrist_motion),
+        _safe_percentile(wrist_motion, 90),
+        _safe_mean(elbow_motion),
+        upper_energy,
+        upper_visibility,
+        _safe_mean(lower_motion),
+        lower_visibility,
+        matched_ratio,
+        ambiguous_ratio,
+        wrist_other_min_dist,
+        wrist_near_other_ratio,
+        upper_energy * overlap_score,
+        match_quality_mean,
+    ], dtype=np.float32)
 
 
 # ***** Steps 4 & 5 : reduce variable-length clips to fixed size

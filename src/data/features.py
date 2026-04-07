@@ -1,11 +1,25 @@
 import numpy as np
 from src.erez_files.analyze_json_motion import (
+    BASE_MOTION_FEATURE_DIM as EREZ_BASE_MOTION_DIM,
     DEFAULT_VERSION as EREZ_DEFAULT_VERSION,
+    EXTENDED_MOTION_FEATURE_DIM as EREZ_EXTENDED_MOTION_DIM,
     extract_motion_features as erez_extract_motion_features,
 )
 
 
-EREZ_MOTION_DIM = 25
+EREZ_MOTION_DIM = EREZ_EXTENDED_MOTION_DIM
+MOTION_EXTRACTOR_KWARG_KEYS = {
+    "kp_min_conf",
+    "match_min_iou",
+    "match_max_center_dist",
+    "match_max_size_ratio",
+    "match_ambiguity_margin",
+    "match_iou_weight",
+    "match_size_weight",
+    "close_pair_dist_thresh",
+    "wrist_near_bbox_thresh",
+    "missing_pair_dist",
+}
 
 
 def _get_detections(frame):
@@ -39,13 +53,22 @@ def motion_feature_dim(feature_cfg=None):
     if motion_cfg.get("source") != "erez":
         raise ValueError(f"Unsupported motion feature source: {motion_cfg.get('source')}")
 
-    requested_dim = motion_cfg.get("num_features", motion_cfg.get("first_n", EREZ_MOTION_DIM))
+    requested_dim = motion_cfg.get("num_features", motion_cfg.get("first_n", EREZ_BASE_MOTION_DIM))
     requested_dim = int(requested_dim)
     if requested_dim <= 0 or requested_dim > EREZ_MOTION_DIM:
         raise ValueError(
             f"features.motion.num_features must be in [1, {EREZ_MOTION_DIM}], got {requested_dim}"
         )
     return requested_dim
+
+
+def motion_extractor_kwargs(feature_cfg=None):
+    motion_cfg = motion_feature_cfg(feature_cfg)
+    return {
+        key: motion_cfg[key]
+        for key in MOTION_EXTRACTOR_KWARG_KEYS
+        if key in motion_cfg
+    }
 
 
 def _to_erez_frame(frame):
@@ -131,24 +154,36 @@ def select_motion_features(motion_values, target_dim: int):
     return motion_values[..., :target_dim].astype(np.float32, copy=False)
 
 
-def extract_erez_motion_features(frames, align="prev", j_version=EREZ_DEFAULT_VERSION):
+def extract_erez_motion_features(
+    frames,
+    align="prev",
+    j_version=EREZ_DEFAULT_VERSION,
+    extended=True,
+    **motion_kwargs,
+):
     if align not in {"prev", "next"}:
         raise ValueError(f"Unsupported motion alignment: {align}")
 
+    full_dim = EREZ_MOTION_DIM if bool(extended) else EREZ_BASE_MOTION_DIM
     num_frames = len(frames)
     if num_frames == 0:
-        return np.zeros((0, EREZ_MOTION_DIM), dtype=np.float32)
-    motion_feats = np.zeros((num_frames, EREZ_MOTION_DIM), dtype=np.float32)
+        return np.zeros((0, full_dim), dtype=np.float32)
+    motion_feats = np.zeros((num_frames, full_dim), dtype=np.float32)
 
     if num_frames == 1:
         return motion_feats
 
     erez_frames = [_to_erez_frame(frame) for frame in frames]
-    erez_motion = erez_extract_motion_features(erez_frames, j_version=float(j_version)).astype(np.float32)
+    erez_motion = erez_extract_motion_features(
+        erez_frames,
+        j_version=float(j_version),
+        extended=bool(extended),
+        **motion_kwargs,
+    ).astype(np.float32)
 
-    if erez_motion.shape[1] != EREZ_MOTION_DIM:
+    if erez_motion.shape[1] != full_dim:
         raise ValueError(
-            f"Unexpected erez motion dimension: expected {EREZ_MOTION_DIM}, got {erez_motion.shape[1]}"
+            f"Unexpected erez motion dimension: expected {full_dim}, got {erez_motion.shape[1]}"
         )
 
     if align == "prev":
