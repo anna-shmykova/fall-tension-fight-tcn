@@ -433,8 +433,13 @@ def save_history_csv(out_dir: Path, history: List[Dict[str, Any]]) -> None:
     if not history:
         return
     csv_path = out_dir / "metrics.csv"
+    fieldnames: List[str] = []
+    for row in history:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
     with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(history)
 

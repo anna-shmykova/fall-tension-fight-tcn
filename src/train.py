@@ -50,6 +50,11 @@ from src.utils.metrics import (
     sigmoid_from_logits,
     summarize_calibration,
 )
+from src.utils.event_eval import (
+    evaluate_event_validation,
+    make_float_grid,
+    save_event_report,
+)
 
 #from sklearn.metrics import average_precision_score, precision_recall_curve
 # ----------------------------
@@ -494,6 +499,152 @@ def build_probability_calibration_report(
         )
 
     return report
+
+
+def optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return float(value)
+
+
+def list_of_floats(value: Any, default: List[float]) -> List[float]:
+    if value is None:
+        return [float(item) for item in default]
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, str):
+        return [float(item.strip()) for item in value.split(",") if item.strip()]
+    return [float(item) for item in value]
+
+
+def list_of_strings(value: Any, default: List[str]) -> List[str]:
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item) for item in value]
+
+
+def resolve_event_validation_cfg(
+    cfg: Dict[str, Any],
+    *,
+    root: Path,
+    data_root: Path,
+    val_paths: List[str],
+    batch_size: int,
+) -> Dict[str, Any]:
+    eval_cfg = cfg.get("eval", {}) if isinstance(cfg, dict) else {}
+    event_cfg = dict(eval_cfg.get("event_validation", {}) or {}) if isinstance(eval_cfg, dict) else {}
+    enabled = bool(event_cfg.get("enabled", False))
+    if not enabled:
+        return {"enabled": False}
+
+    event_paths = list(val_paths)
+    list_value = event_cfg.get("list", event_cfg.get("paths_list", None))
+    if list_value:
+        event_list = resolve_path(str(list_value), root)
+        event_paths = normalize_paths(read_paths_txt(event_list, base_dirs=[data_root, root]))
+        require_existing_paths(event_paths, "event validation")
+
+    if not event_paths:
+        raise ValueError("eval.event_validation.enabled=true but no event validation paths were resolved.")
+
+    threshold_values = make_float_grid(
+        event_cfg.get("thresholds", None),
+        start=float(event_cfg.get("threshold_start", 0.01)),
+        end=float(event_cfg.get("threshold_end", 0.99)),
+        step=float(event_cfg.get("threshold_step", 0.02)),
+    )
+
+    return {
+        "enabled": True,
+        "paths": event_paths,
+        "every_n_epochs": max(1, int(event_cfg.get("every_n_epochs", 1))),
+        "batch_size": int(event_cfg.get("batch_size", batch_size)),
+        "score_methods": list_of_strings(event_cfg.get("score_methods", None), ["raw", "temperature", "platt"]),
+        "threshold_values": threshold_values,
+        "merge_gap_sec_values": list_of_floats(event_cfg.get("merge_gap_sec_values", None), [0.0, 0.5, 1.0, 2.0]),
+        "min_duration_sec_values": list_of_floats(event_cfg.get("min_duration_sec_values", None), [0.0, 0.5, 1.0]),
+        "min_overlap_sec": float(event_cfg.get("min_overlap_sec", 0.0)),
+        "min_match_iou": float(event_cfg.get("min_match_iou", event_cfg.get("min_iou", 0.0))),
+        "selection_score_method": event_cfg.get("selection_score_method", "platt"),
+        "selection_metric": str(event_cfg.get("selection_metric", "f1")),
+        "max_false_alarms_per_min": optional_float(event_cfg.get("max_false_alarms_per_min", None)),
+        "min_recall": optional_float(event_cfg.get("min_recall", None)),
+    }
+
+
+def build_validation_calibration_report(val_out: Dict[str, Any]) -> Dict[str, Any]:
+    val_targets = np.asarray(val_out["targets"], dtype=np.float32)
+    val_logits = np.asarray(val_out["logits"], dtype=np.float32)
+    return build_probability_calibration_report(val_targets, val_logits, val_targets, val_logits)
+
+
+def empty_event_history(prefix: str = "val_event") -> Dict[str, Any]:
+    return {
+        f"{prefix}_score_method": "",
+        f"{prefix}_threshold": float("nan"),
+        f"{prefix}_merge_gap_sec": float("nan"),
+        f"{prefix}_min_duration_sec": float("nan"),
+        f"{prefix}_min_overlap_sec": float("nan"),
+        f"{prefix}_min_match_iou": float("nan"),
+        f"{prefix}_precision": float("nan"),
+        f"{prefix}_recall": float("nan"),
+        f"{prefix}_f1": float("nan"),
+        f"{prefix}_false_alarms_per_min": float("nan"),
+        f"{prefix}_gt_hit_recall": float("nan"),
+        f"{prefix}_time_coverage": float("nan"),
+        f"{prefix}_time_iou": float("nan"),
+        f"{prefix}_n_predicted_events": float("nan"),
+        f"{prefix}_n_gt_events": float("nan"),
+        f"{prefix}_tp": float("nan"),
+        f"{prefix}_fp": float("nan"),
+        f"{prefix}_fn": float("nan"),
+    }
+
+
+def event_history_from_selected(selected: Dict[str, Any] | None, prefix: str = "val_event") -> Dict[str, Any]:
+    row = empty_event_history(prefix=prefix)
+    if not selected:
+        return row
+
+    row[f"{prefix}_score_method"] = str(selected.get("score_method", ""))
+    for key in (
+        "threshold",
+        "merge_gap_sec",
+        "min_duration_sec",
+        "min_overlap_sec",
+        "min_match_iou",
+        "precision",
+        "recall",
+        "f1",
+        "false_alarms_per_min",
+        "gt_hit_recall",
+        "time_coverage",
+        "time_iou",
+        "n_predicted_events",
+        "n_gt_events",
+        "tp",
+        "fp",
+        "fn",
+    ):
+        row[f"{prefix}_{key}"] = safe_float(selected.get(key, float("nan")))
+    return row
+
+
+def compact_event_report(report: Dict[str, Any] | None, artifacts: Dict[str, str] | None = None) -> Dict[str, Any]:
+    if not report:
+        return {}
+    payload = {
+        "settings": report.get("settings", {}),
+        "selected": report.get("selected", {}),
+        "selected_aggregate": report.get("selected_details", {}).get("aggregate", {}),
+    }
+    if artifacts:
+        payload["artifacts"] = artifacts
+    return payload
 
 
 def predict_from_score(score: Any, threshold: Any) -> int | None:
@@ -1091,6 +1242,14 @@ def main() -> None:
     end_loss_k = cfg["train"].get("end_loss_k", 4)
     early_stop_patience = cfg["train"].get("early_stop_patience", None)
     early_stop_patience = int(early_stop_patience) if early_stop_patience is not None else None
+    event_val_cfg = resolve_event_validation_cfg(
+        cfg,
+        root=root,
+        data_root=data_root,
+        val_paths=val_paths,
+        batch_size=bs,
+    )
+    event_val_enabled = bool(event_val_cfg.get("enabled", False))
 
     print(f"[INFO] target_mode: {target_mode}")
     print(f"[INFO] window_label_rule: {window_cfg['rule']} (positive_overlap={window_cfg['positive_overlap']:.2f})")
@@ -1104,6 +1263,14 @@ def main() -> None:
         print("[WARN] model.causal=true but data.target_mode is not 'last'.")
     if target_mode == "last" and str(agg_mode).lower() != "last":
         print("[WARN] data.target_mode='last' but train.agg_mode is not 'last'; validation remains window-level.")
+    if event_val_enabled:
+        print(
+            f"[INFO] event validation: {len(event_val_cfg['paths'])} validation files | "
+            f"{len(event_val_cfg['threshold_values'])} thresholds | "
+            f"merge_gap_sec={event_val_cfg['merge_gap_sec_values']} | "
+            f"min_duration_sec={event_val_cfg['min_duration_sec_values']}",
+            flush=True,
+        )
     print(f"[INFO] save_all_checkpoints: {save_all_checkpoints}")
     
     # 10) Train
@@ -1124,6 +1291,7 @@ def main() -> None:
         val_out = evaluate_binary(model, val_loader, device=device, agg_mode=agg_mode, temperature=temperature)
         val_auprc = val_out["auprc"]
         val_auroc = val_out["auroc"]
+        is_best_candidate = val_auprc > best_auprc
 
         # Step scheduler (ReduceLROnPlateau expects metric)
         scheduler.step(val_auprc)
@@ -1142,8 +1310,57 @@ def main() -> None:
             f"| ece={val_out['ece']:.4f} | thr0.5 F1={fixed05['f1']:.3f} "
             f"(P={fixed05['precision']:.3f}, R={fixed05['recall']:.3f}) | lr={lr:.2e}"
         )
+
+        event_val_report = None
+        if event_val_enabled and (is_best_candidate or epoch % int(event_val_cfg["every_n_epochs"]) == 0):
+            print(
+                f"[INFO] Event validation epoch {epoch:03d}: evaluating {len(event_val_cfg['paths'])} files "
+                f"and sweeping {len(event_val_cfg['threshold_values'])} thresholds.",
+                flush=True,
+            )
+            event_val_report = evaluate_event_validation(
+                model,
+                dataset_cls,
+                event_val_cfg["paths"],
+                K=K,
+                window_size=window_size,
+                window_step=window_step,
+                feature_cfg=feature_cfg,
+                label_cfg=label_cfg,
+                window_cfg=window_cfg,
+                target_mode=target_mode,
+                batch_size=int(event_val_cfg["batch_size"]),
+                device=device,
+                agg_mode=agg_mode,
+                temperature=temperature,
+                calibration_report=build_validation_calibration_report(val_out),
+                raw_threshold=float(val_out["best_f1"]["threshold"]),
+                score_methods=event_val_cfg["score_methods"],
+                threshold_values=event_val_cfg["threshold_values"],
+                merge_gap_sec_values=event_val_cfg["merge_gap_sec_values"],
+                min_duration_sec_values=event_val_cfg["min_duration_sec_values"],
+                min_overlap_sec=float(event_val_cfg["min_overlap_sec"]),
+                min_iou=float(event_val_cfg["min_match_iou"]),
+                selection_score_method=event_val_cfg["selection_score_method"],
+                selection_metric=event_val_cfg["selection_metric"],
+                max_false_alarms_per_min=event_val_cfg["max_false_alarms_per_min"],
+                min_recall=event_val_cfg["min_recall"],
+            )
+            selected_event = event_val_report.get("selected", {})
+            print(
+                f"[VAL EVENT] method={selected_event.get('score_method', '')} "
+                f"thr={safe_float(selected_event.get('threshold', float('nan'))):.2f} "
+                f"merge={safe_float(selected_event.get('merge_gap_sec', float('nan'))):.2f}s "
+                f"min_dur={safe_float(selected_event.get('min_duration_sec', float('nan'))):.2f}s "
+                f"F1={safe_float(selected_event.get('f1', float('nan'))):.4f} "
+                f"P={safe_float(selected_event.get('precision', float('nan'))):.4f} "
+                f"R={safe_float(selected_event.get('recall', float('nan'))):.4f} "
+                f"FA/min={safe_float(selected_event.get('false_alarms_per_min', float('nan'))):.4f} "
+                f"timeIoU={safe_float(selected_event.get('time_iou', float('nan'))):.4f}",
+                flush=True,
+            )
         
-        history.append({
+        history_row = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_auprc": val_auprc,
@@ -1163,7 +1380,10 @@ def main() -> None:
             "thr_07_precision": float(fixed07["precision"]),
             "thr_07_recall": float(fixed07["recall"]),
             "lr": float(lr),
-        })
+        }
+        if event_val_enabled:
+            history_row.update(event_history_from_selected(event_val_report.get("selected", {}) if event_val_report else None))
+        history.append(history_row)
 
         # Save metrics.csv every epoch (safer than only on "best")
         save_history_csv(reports_dir, history)
@@ -1187,7 +1407,7 @@ def main() -> None:
             torch.save(ckpt_payload, epoch_ckpt_path)
         
         # Save best checkpoint + best-epoch artifacts
-        if val_auprc > best_auprc:
+        if is_best_candidate:
             best_auprc = val_auprc
             best_epoch = epoch
             best_val_threshold = float(val_out["best_f1"]["threshold"])
@@ -1195,6 +1415,9 @@ def main() -> None:
             ckpt_path = checkpoints_dir / "best.pt"
             ckpt_payload["best_auprc"] = float(best_auprc)
             torch.save(ckpt_payload, ckpt_path)
+            event_val_artifacts = None
+            if event_val_report:
+                event_val_artifacts = save_event_report(reports_dir, event_val_report, prefix="val_best")
             # Save full metrics for best epoch
             ( metrics_dir / "metrics.json").write_text(
                 json.dumps(
@@ -1219,6 +1442,7 @@ def main() -> None:
                             "fixed_thresholds": val_out["fixed_thresholds"],
                             "n_samples": val_out["n_samples"],
                         },
+                        "val_event": compact_event_report(event_val_report, event_val_artifacts),
                     },
                     indent=2,
                     ensure_ascii=False,
@@ -1299,6 +1523,90 @@ def main() -> None:
             oracle_stats = test_out["best_threshold_stats"]
             roc_rows = compute_roc_points(test_binary_targets, test_probs)
             pr_rows = compute_pr_points(test_binary_targets, test_probs)
+
+            event_val_final_report = None
+            event_test_report = None
+            event_val_final_artifacts = None
+            event_test_artifacts = None
+            if event_val_enabled:
+                print(
+                    f"[INFO] Selecting event parameters on {len(event_val_cfg['paths'])} validation files "
+                    f"with the best checkpoint",
+                    flush=True,
+                )
+                event_val_final_report = evaluate_event_validation(
+                    model,
+                    dataset_cls,
+                    event_val_cfg["paths"],
+                    K=K,
+                    window_size=window_size,
+                    window_step=window_step,
+                    feature_cfg=feature_cfg,
+                    label_cfg=label_cfg,
+                    window_cfg=window_cfg,
+                    target_mode=target_mode,
+                    batch_size=int(event_val_cfg["batch_size"]),
+                    device=device,
+                    agg_mode=agg_mode,
+                    temperature=temperature,
+                    calibration_report=build_probability_calibration_report(
+                        val_final_targets,
+                        val_final_logits,
+                        val_final_targets,
+                        val_final_logits,
+                    ),
+                    raw_threshold=float(val_final_out["best_f1"]["threshold"]),
+                    score_methods=event_val_cfg["score_methods"],
+                    threshold_values=event_val_cfg["threshold_values"],
+                    merge_gap_sec_values=event_val_cfg["merge_gap_sec_values"],
+                    min_duration_sec_values=event_val_cfg["min_duration_sec_values"],
+                    min_overlap_sec=float(event_val_cfg["min_overlap_sec"]),
+                    min_iou=float(event_val_cfg["min_match_iou"]),
+                    selection_score_method=event_val_cfg["selection_score_method"],
+                    selection_metric=event_val_cfg["selection_metric"],
+                    max_false_alarms_per_min=event_val_cfg["max_false_alarms_per_min"],
+                    min_recall=event_val_cfg["min_recall"],
+                )
+                event_val_final_artifacts = save_event_report(final_test_dir, event_val_final_report, prefix="val_selected")
+                selected_event_params = event_val_final_report.get("selected", {})
+                if selected_event_params:
+                    event_score_method = str(selected_event_params["score_method"])
+                    print(
+                        f"[INFO] Applying validation-selected event parameters to {len(test_paths)} test files: "
+                        f"method={event_score_method}, threshold={safe_float(selected_event_params.get('threshold')):.2f}, "
+                        f"merge={safe_float(selected_event_params.get('merge_gap_sec')):.2f}s, "
+                        f"min_dur={safe_float(selected_event_params.get('min_duration_sec')):.2f}s",
+                        flush=True,
+                    )
+                    event_test_report = evaluate_event_validation(
+                        model,
+                        dataset_cls,
+                        test_paths,
+                        K=K,
+                        window_size=window_size,
+                        window_step=window_step,
+                        feature_cfg=feature_cfg,
+                        label_cfg=label_cfg,
+                        window_cfg=window_cfg,
+                        target_mode=target_mode,
+                        batch_size=int(event_val_cfg["batch_size"]),
+                        device=device,
+                        agg_mode=agg_mode,
+                        temperature=temperature,
+                        calibration_report=calibration_report,
+                        raw_threshold=selected_threshold,
+                        score_methods=[event_score_method],
+                        threshold_values=[float(selected_event_params["threshold"])],
+                        merge_gap_sec_values=[float(selected_event_params["merge_gap_sec"])],
+                        min_duration_sec_values=[float(selected_event_params["min_duration_sec"])],
+                        min_overlap_sec=float(selected_event_params["min_overlap_sec"]),
+                        min_iou=float(selected_event_params.get("min_match_iou", event_val_cfg["min_match_iou"])),
+                        selection_score_method=event_score_method,
+                        selection_metric=event_val_cfg["selection_metric"],
+                        max_false_alarms_per_min=None,
+                        min_recall=None,
+                    )
+                    event_test_artifacts = save_event_report(final_test_dir, event_test_report, prefix="test_selected")
 
             print(f"[INFO] Evaluating {len(val_paths)} validation files for video-level threshold selection")
             val_path_rows = evaluate_paths_individually(
@@ -1530,6 +1838,49 @@ def main() -> None:
                 ("video_max_f1", safe_float(test_video_max["selected_threshold_stats"]["f1"])),
                 ("video_max_accuracy", safe_float(test_video_max["selected_threshold_stats"]["accuracy"])),
             ]
+            if event_val_final_report:
+                event_val_selected = event_val_final_report.get("selected", {})
+                summary_rows.extend(
+                    [
+                        ("event_threshold_source", "validation_event_grid"),
+                        ("event_val_score_method", str(event_val_selected.get("score_method", ""))),
+                        ("event_val_selected_threshold", safe_float(event_val_selected.get("threshold", float("nan")))),
+                        ("event_val_merge_gap_sec", safe_float(event_val_selected.get("merge_gap_sec", float("nan")))),
+                        ("event_val_min_duration_sec", safe_float(event_val_selected.get("min_duration_sec", float("nan")))),
+                        ("event_val_min_match_iou", safe_float(event_val_selected.get("min_match_iou", float("nan")))),
+                        ("event_val_precision", safe_float(event_val_selected.get("precision", float("nan")))),
+                        ("event_val_recall", safe_float(event_val_selected.get("recall", float("nan")))),
+                        ("event_val_f1", safe_float(event_val_selected.get("f1", float("nan")))),
+                        ("event_val_false_alarms_per_min", safe_float(event_val_selected.get("false_alarms_per_min", float("nan")))),
+                        ("event_val_time_iou", safe_float(event_val_selected.get("time_iou", float("nan")))),
+                    ]
+                )
+            if event_test_report:
+                event_test_selected = event_test_report.get("selected_details", {}).get(
+                    "aggregate",
+                    event_test_report.get("selected", {}),
+                )
+                summary_rows.extend(
+                    [
+                        ("event_test_score_method", str(event_test_selected.get("score_method", ""))),
+                        ("event_test_selected_threshold", safe_float(event_test_selected.get("threshold", float("nan")))),
+                        ("event_test_merge_gap_sec", safe_float(event_test_selected.get("merge_gap_sec", float("nan")))),
+                        ("event_test_min_duration_sec", safe_float(event_test_selected.get("min_duration_sec", float("nan")))),
+                        ("event_test_min_match_iou", safe_float(event_test_selected.get("min_match_iou", float("nan")))),
+                        ("event_test_n_gt_events", safe_float(event_test_selected.get("n_gt_events", float("nan")))),
+                        ("event_test_n_predicted_events", safe_float(event_test_selected.get("n_predicted_events", float("nan")))),
+                        ("event_test_tp", safe_float(event_test_selected.get("tp", float("nan")))),
+                        ("event_test_fp", safe_float(event_test_selected.get("fp", float("nan")))),
+                        ("event_test_fn", safe_float(event_test_selected.get("fn", float("nan")))),
+                        ("event_test_precision", safe_float(event_test_selected.get("precision", float("nan")))),
+                        ("event_test_recall", safe_float(event_test_selected.get("recall", float("nan")))),
+                        ("event_test_f1", safe_float(event_test_selected.get("f1", float("nan")))),
+                        ("event_test_false_alarms_per_min", safe_float(event_test_selected.get("false_alarms_per_min", float("nan")))),
+                        ("event_test_gt_hit_recall", safe_float(event_test_selected.get("gt_hit_recall", float("nan")))),
+                        ("event_test_time_coverage", safe_float(event_test_selected.get("time_coverage", float("nan")))),
+                        ("event_test_time_iou", safe_float(event_test_selected.get("time_iou", float("nan")))),
+                    ]
+                )
 
             save_summary_csv(final_test_dir / "summary.csv", summary_rows)
 
@@ -1608,6 +1959,23 @@ def main() -> None:
                     "window_test_platt_calibration_bins": str(final_test_dir / "window_test_platt_calibration_bins.csv"),
                 },
             }
+            if event_val_final_report or event_test_report:
+                final_test_payload["event_level"] = {
+                    "threshold_source": "validation_event_grid",
+                    "validation": compact_event_report(event_val_final_report, event_val_final_artifacts),
+                    "test": compact_event_report(event_test_report, event_test_artifacts),
+                }
+                final_test_payload["artifacts"].update(
+                    {
+                        "event_val_grid_csv": str(final_test_dir / "val_selected_event_grid.csv"),
+                        "event_val_summary_json": str(final_test_dir / "val_selected_event_summary.json"),
+                        "event_test_per_file_csv": str(final_test_dir / "test_selected_event_per_file.csv"),
+                        "event_test_matches_csv": str(final_test_dir / "test_selected_event_matches.csv"),
+                        "event_test_fragments_csv": str(final_test_dir / "test_selected_event_fragments.csv"),
+                        "event_test_intervals_csv": str(final_test_dir / "test_selected_event_intervals.csv"),
+                        "event_test_summary_json": str(final_test_dir / "test_selected_event_summary.json"),
+                    }
+                )
             (final_test_dir / "metrics.json").write_text(
                 json.dumps(final_test_payload, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
@@ -1630,6 +1998,22 @@ def main() -> None:
                 f"max_thr={float(test_video_max['selected_threshold']):.2f} "
                 f"F1={test_video_max['selected_threshold_stats']['f1']:.4f}"
             )
+            if event_test_report:
+                event_test_selected = event_test_report.get("selected_details", {}).get(
+                    "aggregate",
+                    event_test_report.get("selected", {}),
+                )
+                print(
+                    f"[FINAL TEST EVENT] method={event_test_selected.get('score_method', '')} "
+                    f"thr={safe_float(event_test_selected.get('threshold', float('nan'))):.2f} "
+                    f"merge={safe_float(event_test_selected.get('merge_gap_sec', float('nan'))):.2f}s "
+                    f"min_dur={safe_float(event_test_selected.get('min_duration_sec', float('nan'))):.2f}s "
+                    f"F1={safe_float(event_test_selected.get('f1', float('nan'))):.4f} "
+                    f"P={safe_float(event_test_selected.get('precision', float('nan'))):.4f} "
+                    f"R={safe_float(event_test_selected.get('recall', float('nan'))):.4f} "
+                    f"FA/min={safe_float(event_test_selected.get('false_alarms_per_min', float('nan'))):.4f} "
+                    f"timeIoU={safe_float(event_test_selected.get('time_iou', float('nan'))):.4f}"
+                )
     print(f"[DONE] Best AUPRC: {best_auprc:.4f}")
     print(f"[DONE] Run saved to: {run_dir}")
 

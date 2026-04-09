@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_motion_42_wind_8_step_1_limb_bbox_dataset_v2
+  name: tcn_causal_mlp_pool_motion_42_wind_16_step_1_limb_bbox_dataset_v2
   seed: 42
 
 paths:
@@ -9,7 +9,7 @@ paths:
 data:
   label_mode: "binary_tension"
   target_mode: last
-  window_size: 8
+  window_size: 16
   window_step: 1
   fps: 25
   sample_every_n_frames: 5
@@ -55,7 +55,7 @@ features:
     missing_pair_dist: 1.0
 
 model:
-  type: "motion_tcn"
+  type: "tcn"
   use_graph: false
   use_attention_readout: false
   causal: true
@@ -83,7 +83,7 @@ train:
   device: cuda
   agg_mode: last
   logsumexp_temperature: 1.0
-  end_loss_alpha: 0.1
+  end_loss_alpha: 0.0
   end_loss_k: 2
   save_all_checkpoints: true
 
@@ -92,3 +92,21 @@ eval:
     start: 0.01
     end: 0.99
     step: 0.01
+  event_validation:
+    enabled: true
+    # By default this uses data.split.val_list. Set list to a long-video-only
+    # validation file if you want window validation and event validation separate.
+    list: "fixed_splits/event_val_paths.txt"
+    every_n_epochs: 1
+    score_methods: ["raw", "temperature", "platt"]
+    threshold_start: 0.01
+    threshold_end: 0.99
+    threshold_step: 0.02
+    merge_gap_sec_values: [0.0, 0.5, 1.0, 2.0]
+    min_duration_sec_values: [0.0, 0.5, 1.0]
+    min_overlap_sec: 0.0
+    min_match_iou: 0.05
+    selection_score_method: platt
+    selection_metric: time_iou
+    max_false_alarms_per_min:
+    min_recall:
