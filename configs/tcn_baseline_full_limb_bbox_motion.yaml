@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_mlp_pool_motion_42_wind_16_step_1_limb_bbox_dataset_v2
+  name: tcn_causal_intraperson_graph_pool_motion_42_wind_8_step_1_limb_bbox_dataset_v2
   seed: 42
 
 paths:
@@ -9,7 +9,7 @@ paths:
 data:
   label_mode: "binary_tension"
   target_mode: last
-  window_size: 16
+  window_size: 8
   window_step: 1
   fps: 25
   sample_every_n_frames: 5
@@ -44,7 +44,7 @@ features:
     # 1-25 are the original Erez motion/overlap features.
     # 26-42 add bbox proximity, upper/lower limb motion, wrist-to-other-person proximity,
     # and bbox-match reliability/ambiguity features.
-    num_features: 42
+    num_features: 21
     kp_min_conf: 0.3
     match_min_iou: 0.2
     match_max_center_dist: 0.15
@@ -56,6 +56,7 @@ features:
 
 model:
   type: "tcn"
+  encoder_type: intraperson_graph
   use_graph: false
   use_attention_readout: false
   causal: true
@@ -65,7 +66,7 @@ model:
   dilations: [1, 2, 4, 8]
   kernel_size: 3
   dropout: 0.2
-  mlp_out_dim: 32
+  person_emb_dim: 32
   pool_mode: mean_max_std
   tcn_input_mode: pooled_count_motion
   use_person_count: true

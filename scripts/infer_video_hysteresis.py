@@ -26,7 +26,13 @@ from src.data.features import (
     motion_feature_dim,
 )
 from src.data.labels import events_to_label
-from src.models.tcn import EventTCN, MotionTCN
+from src.models.tcn import (
+    EventTCN,
+    MotionTCN,
+    infer_encoder_type,
+    normalize_event_state_dict,
+    state_dict_has_prefix,
+)
 
 
 MOTION_ONLY_MODEL_TYPES = {"motion_tcn", "erez_motion_tcn"}
@@ -344,28 +350,12 @@ def infer_num_layers_from_state_dict(state_dict: dict) -> int:
     return max(layer_ids) + 1 if layer_ids else 1
 
 
-def state_dict_has_prefix(state_dict: dict, prefix: str) -> bool:
-    return any(key.startswith(prefix) for key in state_dict)
-
-
 def infer_event_pool_mode(state_dict: dict, configured_pool_mode: Optional[str]) -> str:
     if state_dict_has_prefix(state_dict, "pool.score.") or state_dict_has_prefix(state_dict, "pool.attn.score."):
         return "attn"
     if configured_pool_mode and str(configured_pool_mode) != "attn":
         return str(configured_pool_mode)
     return "mean_max_std"
-
-
-def normalize_event_state_dict(state_dict: dict) -> dict:
-    if state_dict_has_prefix(state_dict, "pool.score.") and not state_dict_has_prefix(state_dict, "pool.attn.score."):
-        remapped = {}
-        for key, value in state_dict.items():
-            if key.startswith("pool.score."):
-                remapped[key.replace("pool.score.", "pool.attn.score.", 1)] = value
-            else:
-                remapped[key] = value
-        return remapped
-    return state_dict
 
 
 def resolve_model_artifacts(args) -> Tuple[Path, dict, dict]:
@@ -422,9 +412,13 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
         use_graph = has_graph
         pool_mode = infer_event_pool_mode(state_dict, model_cfg.get("pool_mode"))
         use_attention_readout = True if has_attn else False if model_cfg.get("use_attention_readout") is True else None
-        mlp_out_dim = int(model_cfg.get("mlp_out_dim", 32))
+        encoder_type = infer_encoder_type(state_dict=state_dict, configured=model_cfg.get("encoder_type"))
+        person_emb_dim = int(model_cfg.get("person_emb_dim", model_cfg.get("mlp_out_dim", 32)))
+        encoder_hidden_dim = int(model_cfg.get("encoder_hidden_dim", 128))
+        encoder_graph_dim = model_cfg.get("encoder_graph_dim", None)
+        encoder_num_layers = int(model_cfg.get("encoder_num_layers", 2))
         pool_mult = {"mean": 1, "max": 1, "mean_max": 2, "mean_max_std": 3, "attn": 1}
-        base_scene_in = mlp_out_dim * pool_mult[pool_mode]
+        base_scene_in = person_emb_dim * pool_mult[pool_mode]
         actual_tcn_in = infer_tcn_in_channels_from_state_dict(state_dict)
 
         motion_proj_dim = None
@@ -489,9 +483,13 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
             num_layers=int(model_cfg.get("num_layers", 4)),
             dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
-            mlp_out_dim=mlp_out_dim,
+            person_emb_dim=person_emb_dim,
             pool_mode=pool_mode,
             use_attention_readout=use_attention_readout,
+            encoder_type=encoder_type,
+            encoder_hidden_dim=encoder_hidden_dim,
+            encoder_graph_dim=int(encoder_graph_dim) if encoder_graph_dim is not None else None,
+            encoder_num_layers=encoder_num_layers,
             use_graph=use_graph,
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),

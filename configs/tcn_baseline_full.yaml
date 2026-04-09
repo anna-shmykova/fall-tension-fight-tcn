@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_mlp_last_aggr_pool_motion_21_ALL_DS_usual_loss_alpha_window_16_exclude_tens
+  name: tcn_causal_intraperson_graph_last_aggr_pool_motion_21_ALL_DS_usual_loss_alpha_window_16_exclude_tens
   seed: 42
 
 paths:
@@ -46,6 +46,7 @@ features:
 
 model:
   type: "tcn"
+  encoder_type: intraperson_graph
   use_graph: false
   use_attention_readout: false   # true forces attn; false uses pool_mode below
   causal: true
@@ -55,7 +56,7 @@ model:
   dilations: [1, 2, 4, 8]
   kernel_size: 3
   dropout: 0.2
-  mlp_out_dim: 32
+  person_emb_dim: 32
   pool_mode: mean_max_std   # choices when attention is off: mean, max, mean_max, mean_max_std
   tcn_input_mode: pooled_count_motion   # choices: pooled_count, pooled_count_motion
   use_person_count: true

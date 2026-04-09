@@ -1,16 +1,30 @@
+"""Temporal models used by training and inference.
+
+`EventTCN` is the main model:
+1. encode each person in each frame,
+2. optionally refine people with an interpersonal graph,
+3. pool people into one scene embedding per frame,
+4. run a temporal convolution network over the sequence.
+
+`MotionTCN` is the simpler baseline that works directly on motion features.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.models.encoders import BoneMLPEncoder
+from src.models.encoders import BoneMLPEncoder, IntrapersonGraphEncoder, infer_max_persons_from_input_dim
 from src.models.pooling import PersonPooling
 from src.models.graph import InterpersonalGraph
 
 
 VALID_POOL_MODES = {"mean", "max", "mean_max", "mean_max_std", "attn"}
 DEFAULT_NON_ATTN_POOL_MODE = "mean_max_std"
+VALID_ENCODER_TYPES = {"mlp", "intraperson_graph"}
+DEFAULT_ENCODER_TYPE = "intraperson_graph"
 
 
 def resolve_pool_mode(pool_mode="attn", use_attention_readout=None):
+    """Resolve the effective pooling mode from legacy and new config flags."""
     pool_mode = str(pool_mode)
 
     if use_attention_readout is True:
@@ -25,7 +39,77 @@ def resolve_pool_mode(pool_mode="attn", use_attention_readout=None):
     return effective_pool_mode
 
 
+def state_dict_has_prefix(state_dict, prefix):
+    """Return True when any checkpoint key starts with `prefix`."""
+    return any(key.startswith(prefix) for key in state_dict)
+
+
+def resolve_encoder_type(encoder_type=None):
+    """Normalize the requested person encoder type."""
+    if encoder_type is None:
+        return DEFAULT_ENCODER_TYPE
+
+    resolved = str(encoder_type).lower()
+    if resolved not in VALID_ENCODER_TYPES:
+        raise ValueError(f"Unsupported encoder_type: {resolved}")
+    return resolved
+
+
+def infer_encoder_type(state_dict=None, configured=None):
+    """Infer which encoder produced a checkpoint.
+
+    Old checkpoints store the person encoder under `mlp.*`.
+    New checkpoints store it under `encoder.*`, with graph-specific submodules.
+    """
+    if configured is not None:
+        return resolve_encoder_type(configured)
+
+    state_dict = state_dict or {}
+    if (
+        state_dict_has_prefix(state_dict, "encoder.node_proj.")
+        or state_dict_has_prefix(state_dict, "encoder.layers.")
+        or state_dict_has_prefix(state_dict, "encoder.joint_embed.")
+    ):
+        return "intraperson_graph"
+    if state_dict_has_prefix(state_dict, "mlp.") or state_dict_has_prefix(state_dict, "encoder.mlp."):
+        return "mlp"
+    if state_dict_has_prefix(state_dict, "encoder."):
+        return DEFAULT_ENCODER_TYPE
+    return DEFAULT_ENCODER_TYPE
+
+
+def normalize_event_state_dict(state_dict):
+    """Rewrite legacy checkpoint keys into the current naming scheme.
+
+    Currently handled:
+    - `pool.score.*` -> `pool.attn.score.*`
+    - `mlp.*` -> `encoder.*`
+    """
+    remapped = dict(state_dict)
+
+    if state_dict_has_prefix(remapped, "pool.score.") and not state_dict_has_prefix(remapped, "pool.attn.score."):
+        updated = {}
+        for key, value in remapped.items():
+            if key.startswith("pool.score."):
+                updated[key.replace("pool.score.", "pool.attn.score.", 1)] = value
+            else:
+                updated[key] = value
+        remapped = updated
+
+    if state_dict_has_prefix(remapped, "mlp.") and not state_dict_has_prefix(remapped, "encoder."):
+        updated = {}
+        for key, value in remapped.items():
+            if key.startswith("mlp."):
+                updated[key.replace("mlp.", "encoder.", 1)] = value
+            else:
+                updated[key] = value
+        remapped = updated
+
+    return remapped
+
+
 def resolve_dilations(num_layers=3, dilations=None):
+    """Return the dilation schedule for the temporal convolution stack."""
     if dilations is None:
         resolved = []
         dilation = 1
@@ -68,6 +152,8 @@ class CausalConv1d(nn.Module):
 
 
 class TemporalConvBlock(nn.Module):
+    """One temporal conv block: conv -> norm -> ReLU."""
+
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, causal=False, norm="group"):
         super().__init__()
         self.causal = bool(causal)
@@ -94,6 +180,7 @@ class TemporalConvBlock(nn.Module):
             self.norm = nn.GroupNorm(1, out_channels)
 
     def forward(self, x):
+        """Apply one temporal block to `[B, C, T]` features."""
         out = self.conv(x)
         out = self.norm(out)
         out = F.relu(out)
@@ -101,6 +188,17 @@ class TemporalConvBlock(nn.Module):
 
 
 class EventTCN(nn.Module):
+    """Main event model combining pose encoding, pooling, and temporal context.
+
+    Tensor flow:
+        raw frame vector
+            -> per-person encoder
+            -> optional interpersonal graph
+            -> person pooling
+            -> temporal convolution stack
+            -> per-time-step event logits
+    """
+
     def __init__(
                     self,
                     input_dim=97,
@@ -110,8 +208,13 @@ class EventTCN(nn.Module):
                     dilations=None,
                     kernel_size=3,
                     mlp_out_dim=32,
+                    person_emb_dim=None,
                     pool_mode="attn",
                     use_attention_readout=None,
+                    encoder_type=DEFAULT_ENCODER_TYPE,
+                    encoder_hidden_dim=128,
+                    encoder_graph_dim=None,
+                    encoder_num_layers=2,
                     use_graph=True,
                     causal=True,
                     norm="group",
@@ -120,19 +223,39 @@ class EventTCN(nn.Module):
                     motion_proj_dim=None,
                     tcn_input_mode="pooled_count",
                     use_person_count=True,
-                ):
+    ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.motion_dim = int(motion_dim)
         self.tcn_input_mode = str(tcn_input_mode)
         self.use_person_count = bool(use_person_count)
         self.use_graph = bool(use_graph)
+        self.encoder_type = resolve_encoder_type(encoder_type)
+        self.person_emb_dim = int(person_emb_dim if person_emb_dim is not None else mlp_out_dim)
         self.pool_mode = resolve_pool_mode(pool_mode=pool_mode, use_attention_readout=use_attention_readout)
+        # The flat input width already encodes how many person slots exist.
+        max_persons = infer_max_persons_from_input_dim(input_dim=self.input_dim, motion_dim=self.motion_dim)
 
-        self.mlp = BoneMLPEncoder(out_dim=mlp_out_dim)
+        if self.encoder_type == "mlp":
+            # Legacy handcrafted per-person encoder.
+            self.encoder = BoneMLPEncoder(
+                K=max_persons,
+                out_dim=self.person_emb_dim,
+                hidden=int(encoder_hidden_dim),
+            )
+        else:
+            # New default: graph over joints inside each person skeleton.
+            self.encoder = IntrapersonGraphEncoder(
+                K=max_persons,
+                out_dim=self.person_emb_dim,
+                hidden=int(encoder_hidden_dim),
+                graph_dim=int(encoder_graph_dim) if encoder_graph_dim is not None else None,
+                num_layers=int(encoder_num_layers),
+                dropout=dropout,
+            )
         self.graph = (
             InterpersonalGraph(
-                                dim=mlp_out_dim,
+                                dim=self.person_emb_dim,
                                 k_nn=2,
                                 radius=2.5,
                                 hidden=hidden_dim,
@@ -141,10 +264,12 @@ class EventTCN(nn.Module):
             if self.use_graph
             else None
         )
-        attn_hidden_dim = 32 if self.pool_mode == "attn" else mlp_out_dim
+        # Attention pooling uses a small hidden layer; non-attention pooling does
+        # not need one because it is purely statistical.
+        attn_hidden_dim = 32 if self.pool_mode == "attn" else self.person_emb_dim
         self.pool = PersonPooling(
                                 mode=self.pool_mode,
-                                emb_dim=mlp_out_dim,
+                                emb_dim=self.person_emb_dim,
                                 attn_hidden_dim=attn_hidden_dim,
                                 dropout=dropout,
                             )
@@ -167,6 +292,8 @@ class EventTCN(nn.Module):
                 self.motion_proj = nn.Identity()
                 motion_out_dim = self.motion_dim
             else:
+                # Optional projection for auxiliary motion features before
+                # concatenating them with pooled scene features.
                 motion_proj_dim = int(motion_proj_dim)
                 self.motion_proj = nn.Linear(self.motion_dim, motion_proj_dim)
                 motion_out_dim = motion_proj_dim
@@ -175,7 +302,9 @@ class EventTCN(nn.Module):
             motion_out_dim = 0
 
         count_dim = 1 if self.use_person_count else 0
-        in_ch = mlp_out_dim * pool_mult[self.pool_mode] + count_dim + (motion_out_dim if use_motion else 0)
+        # TCN input width depends on how we pool people and whether we append
+        # person count and/or motion features.
+        in_ch = self.person_emb_dim * pool_mult[self.pool_mode] + count_dim + (motion_out_dim if use_motion else 0)
 
         layers = []
         for dilation in resolve_dilations(num_layers=num_layers, dilations=dilations):
@@ -195,17 +324,24 @@ class EventTCN(nn.Module):
         self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
+        """Return per-time-step logits with shape `[B, T]`."""
         motion = None
         pose_x = x
         if self.motion_dim > 0:
             if x.size(-1) <= self.motion_dim:
                 raise ValueError("Input does not contain the expected static pose channels")
+            # Split the raw feature vector back into pose features and optional
+            # motion features appended by the dataset builder.
             pose_x = x[..., :-self.motion_dim]
             motion = x[..., -self.motion_dim:]
 
-        emb, person_mask, person_bboxes = self.mlp(pose_x)      # (B,T,N,E), (B,T,N), (B,T,N,4)
+        # Encode each person in each frame.
+        emb, person_mask, person_bboxes = self.encoder(pose_x)  # (B,T,N,E), (B,T,N), (B,T,N,4)
         if self.graph is not None:
+            # Optionally let nearby people exchange information inside a frame.
             emb = self.graph(emb, person_bboxes, person_mask)   # (B,T,N,E)
+
+        # Collapse the person dimension to get one frame-level scene embedding.
         scene, _ = self.pool(emb, mask=person_mask, return_attn=True)
         tcn_inputs = [scene]
         if self.use_person_count:
@@ -218,6 +354,7 @@ class EventTCN(nn.Module):
                 raise ValueError("Motion features are enabled in the model but missing at runtime")
             tcn_inputs.append(self.motion_proj(motion))
 
+        # Temporal conv expects channels-first `[B, C, T]`.
         scene_count = torch.cat(tcn_inputs, dim=-1)             # (B,T,E_scene+1[+motion])
 
         feat = self.tcn(scene_count.transpose(1, 2))        # (B, hidden, T)
@@ -227,6 +364,8 @@ class EventTCN(nn.Module):
 
 
 class MotionTCN(nn.Module):
+    """Simpler baseline that runs a TCN directly on motion features only."""
+
     def __init__(
                     self,
                     input_dim=25,
@@ -238,7 +377,7 @@ class MotionTCN(nn.Module):
                     causal=True,
                     norm="group",
                     input_proj_dim=0,
-                ):
+    ):
         super().__init__()
         self.input_dim = int(input_dim)
 
@@ -268,6 +407,7 @@ class MotionTCN(nn.Module):
         self.head = nn.Conv1d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
+        """Return per-time-step logits from motion-only inputs `[B, T, C]`."""
         if self.input_proj is not None:
             x = self.input_proj(x)
 

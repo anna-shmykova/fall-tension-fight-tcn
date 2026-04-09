@@ -26,7 +26,7 @@ from src.data.dataset import EventJsonDataset, MotionJsonDataset, resolve_window
 from src.data.json_io import read_json_frames
 from src.data.labels import events_to_label, resolve_label_cfg
 from src.data.features import motion_feature_dim
-from src.models.tcn import EventTCN, MotionTCN
+from src.models.tcn import EventTCN, MotionTCN, resolve_encoder_type
 from src.utils.metrics import (
     apply_platt_scaling,
     apply_temperature_scaling,
@@ -1175,6 +1175,11 @@ def main() -> None:
     motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
     use_attention_readout = model_cfg.get("use_attention_readout", None)
     use_graph = bool(model_cfg.get("use_graph", True))
+    encoder_type = resolve_encoder_type(model_cfg.get("encoder_type"))
+    person_emb_dim = int(model_cfg.get("person_emb_dim", model_cfg.get("mlp_out_dim", 32)))
+    encoder_hidden_dim = int(model_cfg.get("encoder_hidden_dim", 128))
+    encoder_graph_dim = model_cfg.get("encoder_graph_dim", None)
+    encoder_num_layers = int(model_cfg.get("encoder_num_layers", 2))
 
     if model_type not in {"motion_tcn", "erez_motion_tcn"} and tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
         raise ValueError(
@@ -1200,9 +1205,13 @@ def main() -> None:
             num_layers=int(model_cfg.get("num_layers", 4)),
             dilations=model_cfg.get("dilations"),
             kernel_size=int(model_cfg.get("kernel_size", 3)),
-            mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+            person_emb_dim=person_emb_dim,
             pool_mode=str(model_cfg.get("pool_mode", "attn")),
             use_attention_readout=use_attention_readout,
+            encoder_type=encoder_type,
+            encoder_hidden_dim=encoder_hidden_dim,
+            encoder_graph_dim=int(encoder_graph_dim) if encoder_graph_dim is not None else None,
+            encoder_num_layers=encoder_num_layers,
             use_graph=use_graph,
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),

@@ -33,6 +33,8 @@ labels:
   drop_mixed_windows: true
 
 model:
+  encoder_type: intraperson_graph
+  person_emb_dim: 32
   use_graph: true
   use_attention_readout: true
   pool_mode: mean_max_std

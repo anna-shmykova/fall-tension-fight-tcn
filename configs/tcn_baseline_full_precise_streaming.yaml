@@ -1,5 +1,5 @@
 exp:
-  name: tcn_event_pool_motion_21_soft_4_loss_wind_8_step_1_dataset_v2_precise_streaming
+  name: tcn_eventintraperson_graph_pool_motion_21_soft_4_loss_wind_8_step_1_dataset_v2_precise_streaming
   seed: 42
 
 paths:
@@ -21,9 +21,10 @@ data:
     val_ratio: 0.2
     train_list: "fixed_splits/train_paths.txt"
     val_list: "fixed_splits/val_paths.txt"
+    test_list: "fixed_splits/test_files_hospital.txt"
 
 window_labels:
-  rule: soft_last_k #target
+  rule: target #soft_last_k #target
   positive_overlap: 0.30
   soft_k: 4
 
@@ -41,9 +42,18 @@ features:
     source: erez
     align: prev
     num_features: 21
+    kp_min_conf: 0.3
+    match_min_iou: 0.2
+    match_max_center_dist: 0.15
+    match_max_size_ratio: 2.5
+    match_ambiguity_margin: 0.03
+    close_pair_dist_thresh: 0.15
+    wrist_near_bbox_thresh: 0.08
+    missing_pair_dist: 1.0
 
 model:
   type: tcn
+  encoder_type: intraperson_graph
   use_graph: false
   use_attention_readout: false
   causal: true
@@ -53,7 +63,7 @@ model:
   dilations: [1, 2, 4, 8]
   kernel_size: 3
   dropout: 0.2
-  mlp_out_dim: 32
+  person_emb_dim: 32
   pool_mode: mean_max_std
   tcn_input_mode: pooled_count_motion
   use_person_count: true
@@ -64,7 +74,7 @@ train:
   epochs: 15
   lr: 0.0005
   weight_decay: 0.0001
-  pos_weight: 2.0
+  pos_weight: 1.0
   grad_clip: 1.0
   early_stop_patience: 3
   num_workers: 0

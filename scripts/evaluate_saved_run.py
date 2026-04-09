@@ -21,7 +21,7 @@ from src.data.json_io import read_json_frames
 from src.data.labels import events_to_label, resolve_label_cfg
 from src.data.motion_sequence import build_motion_sequence
 from src.data.splits import read_paths_txt
-from src.models.tcn import EventTCN, MotionTCN
+from src.models.tcn import EventTCN, MotionTCN, infer_encoder_type, normalize_event_state_dict
 from src.train import (
     aggregate_window_logits,
     build_dataset,
@@ -89,16 +89,22 @@ def resolve_label_cfg_from_root(cfg: dict[str, Any]) -> dict[str, Any]:
     return resolve_label_cfg(label_cfg)
 
 
-def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
+def build_model(cfg: dict[str, Any], input_dim: int, state_dict: dict[str, Any] | None = None) -> torch.nn.Module:
     feature_cfg = cfg.get("features", {})
     model_cfg = cfg.get("model", {})
     model_type = str(model_cfg.get("type", "tcn")).lower()
     motion_dim = motion_feature_dim(feature_cfg)
+    state_dict = normalize_event_state_dict(state_dict or {})
 
     tcn_input_mode = str(model_cfg.get("tcn_input_mode", "pooled_count"))
     motion_proj_dim = model_cfg.get("motion_proj_dim", model_cfg.get("input_proj_dim", None))
     use_attention_readout = model_cfg.get("use_attention_readout", None)
     use_graph = bool(model_cfg.get("use_graph", True))
+    encoder_type = infer_encoder_type(state_dict=state_dict, configured=model_cfg.get("encoder_type"))
+    person_emb_dim = int(model_cfg.get("person_emb_dim", model_cfg.get("mlp_out_dim", 32)))
+    encoder_hidden_dim = int(model_cfg.get("encoder_hidden_dim", 128))
+    encoder_graph_dim = model_cfg.get("encoder_graph_dim", None)
+    encoder_num_layers = int(model_cfg.get("encoder_num_layers", 2))
 
     if model_type not in {"motion_tcn", "erez_motion_tcn"} and tcn_input_mode == "pooled_count_motion" and motion_dim == 0:
         raise ValueError(
@@ -124,9 +130,13 @@ def build_model(cfg: dict[str, Any], input_dim: int) -> torch.nn.Module:
         num_layers=int(model_cfg.get("num_layers", 4)),
         dilations=model_cfg.get("dilations"),
         kernel_size=int(model_cfg.get("kernel_size", 3)),
-        mlp_out_dim=int(model_cfg.get("mlp_out_dim", 32)),
+        person_emb_dim=person_emb_dim,
         pool_mode=str(model_cfg.get("pool_mode", "attn")),
         use_attention_readout=use_attention_readout,
+        encoder_type=encoder_type,
+        encoder_hidden_dim=encoder_hidden_dim,
+        encoder_graph_dim=int(encoder_graph_dim) if encoder_graph_dim is not None else None,
+        encoder_num_layers=encoder_num_layers,
         use_graph=use_graph,
         causal=bool(model_cfg.get("causal", True)),
         norm=str(model_cfg.get("norm", "group")),
@@ -956,10 +966,11 @@ def main() -> None:
     if len(preview_ds) == 0:
         raise RuntimeError("Validation and test datasets both have 0 windows after filtering.")
 
-    X0, _ = preview_ds[0]
-    model = build_model(cfg, input_dim=int(X0.shape[-1]))
     payload = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(payload["model"])
+    state_dict = normalize_event_state_dict(payload["model"])
+    X0, _ = preview_ds[0]
+    model = build_model(cfg, input_dim=int(X0.shape[-1]), state_dict=state_dict)
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 

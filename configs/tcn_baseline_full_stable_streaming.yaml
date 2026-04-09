@@ -1,5 +1,5 @@
 exp:
-  name: tcn_event_full_mlp_pool_motion_21_wind_8_dataset_v2_stable_streaming
+  name: tcn_event_full_intraperson_graph_pool_motion_21_wind_8_dataset_v2_stable_streaming
   seed: 42
 
 paths:
@@ -44,6 +44,7 @@ features:
 
 model:
   type: tcn
+  encoder_type: intraperson_graph
   use_graph: false
   use_attention_readout: false
   causal: true
@@ -53,7 +54,7 @@ model:
   dilations: [1, 2, 4, 8]
   kernel_size: 3
   dropout: 0.2
-  mlp_out_dim: 32
+  person_emb_dim: 32
   pool_mode: mean_max_std
   tcn_input_mode: pooled_count_motion
   use_person_count: true
