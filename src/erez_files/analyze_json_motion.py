@@ -2,7 +2,7 @@
     This file converts per-frame detections/keypoints into a clip-level motion
     representation. The main entry point is `extract_motion_features(...)`, which
     builds one 25-dim feature vector for each pair of consecutive frames by default,
-    or 42 dims when extended=True.
+    or 48 dims when extended=True.
     Feature order:
     1.  d_mean_center_x      : change in mean bbox center (x,y); global  crowd motion
     2.  d_mean_center_y      :
@@ -49,6 +49,12 @@
     40. wrist_near_other_bbox_ratio    : fraction of visible wrists close to another person's bbox
     41. upper_limb_overlap_motion      : upper_limb_rel_motion_energy weighted by bbox overlap
     42. match_quality_mean             : mean accepted bbox-match quality
+    43. body_anchor_dist_min           : nearest torso/body-anchor distance in frame t+1
+    44. d_body_anchor_dist_min         : change in nearest torso/body-anchor distance; negative means closing
+    45. head_to_head_dist_min          : nearest visible head-anchor distance in frame t+1
+    46. wrist_to_other_body_anchor_min : closest visible wrist to another person's torso/body anchor
+    47. pair_rel_speed_mean_abs        : mean absolute matched pairwise body-anchor distance change
+    48. pair_closing_speed_min         : strongest matched pairwise body-anchor closing speed
 """
 
 import numpy as np
@@ -56,12 +62,16 @@ import numpy as np
 N_Keypoints = 17
 DEFAULT_VERSION = 2.0
 BASE_MOTION_FEATURE_DIM = 25
-EXTENDED_MOTION_FEATURE_DIM = 42
+EXTENDED_MOTION_FEATURE_DIM = 48
 
 WRIST_KP = (9, 10)
 ELBOW_KP = (7, 8)
 UPPER_LIMB_KP = (5, 6, 7, 8, 9, 10)
 LOWER_LIMB_KP = (11, 12, 13, 14, 15, 16)
+HEAD_KP = (0, 1, 2, 3, 4)
+SHOULDER_KP = (5, 6)
+HIP_KP = (11, 12)
+TORSO_KP = (5, 6, 11, 12)
 
 DEFAULT_KP_CONF_MIN = 0.3
 DEFAULT_MATCH_MIN_IOU = 0.2
@@ -434,12 +444,75 @@ def _pairwise_center_distances(persons):
     return dists[iu].astype(np.float32)
 
 
+def _pairwise_point_distances(points):
+    if len(points) < 2:
+        return np.zeros((0,), dtype=np.float32)
+
+    coords = np.asarray(points, dtype=np.float32)
+    diffs = coords[:, None, :] - coords[None, :, :]
+    dists = np.linalg.norm(diffs, axis=-1)
+    iu = np.triu_indices(len(coords), k=1)
+    return dists[iu].astype(np.float32)
+
+
 def _bbox_proximity_features(persons, close_dist_thresh, missing_pair_dist):
     dists = _pairwise_center_distances(persons)
     if len(dists) == 0:
         return float(missing_pair_dist), 0.0
 
     return float(dists.min()), float(np.mean(dists <= close_dist_thresh))
+
+
+def _mean_valid_keypoints(person, kp_indices):
+    idx = np.asarray(tuple(kp_indices), dtype=np.int64)
+    valid = person['kp_valid'][idx]
+    if not np.any(valid):
+        return None
+    return person['keypoints'][idx[valid]].mean(axis=0).astype(np.float32)
+
+
+def _person_body_anchor(person):
+    hips = np.asarray(HIP_KP, dtype=np.int64)
+    if np.all(person['kp_valid'][hips]):
+        return person['keypoints'][hips].mean(axis=0).astype(np.float32)
+
+    shoulders = np.asarray(SHOULDER_KP, dtype=np.int64)
+    if np.all(person['kp_valid'][shoulders]):
+        return person['keypoints'][shoulders].mean(axis=0).astype(np.float32)
+
+    torso_anchor = _mean_valid_keypoints(person, TORSO_KP)
+    if torso_anchor is not None:
+        return torso_anchor
+
+    all_valid = person['kp_valid']
+    if np.any(all_valid):
+        return person['keypoints'][all_valid].mean(axis=0).astype(np.float32)
+
+    return person['center'].astype(np.float32)
+
+
+def _person_head_anchor(person):
+    return _mean_valid_keypoints(person, HEAD_KP)
+
+
+def _body_anchor_proximity_features(persons, missing_pair_dist):
+    anchors = [_person_body_anchor(person) for person in persons]
+    dists = _pairwise_point_distances(anchors)
+    if len(dists) == 0:
+        return float(missing_pair_dist)
+    return float(dists.min())
+
+
+def _head_anchor_proximity_features(persons, missing_pair_dist):
+    anchors = []
+    for person in persons:
+        head_anchor = _person_head_anchor(person)
+        if head_anchor is not None:
+            anchors.append(head_anchor)
+    dists = _pairwise_point_distances(anchors)
+    if len(dists) == 0:
+        return float(missing_pair_dist)
+    return float(dists.min())
 
 
 def _match_persons_by_bbox(prev_persons, curr_persons, **kwargs):
@@ -562,6 +635,50 @@ def _wrist_to_other_bbox_features(persons, near_thresh, missing_pair_dist):
     return float(distances.min()), float(np.mean(distances <= near_thresh))
 
 
+def _wrist_to_other_body_anchor_min(persons, missing_pair_dist):
+    distances = []
+
+    for person_idx, person in enumerate(persons):
+        for kp_idx in WRIST_KP:
+            if not person['kp_valid'][kp_idx]:
+                continue
+
+            wrist = person['keypoints'][kp_idx]
+            for other_idx, other in enumerate(persons):
+                if other_idx == person_idx:
+                    continue
+                other_anchor = _person_body_anchor(other)
+                distances.append(float(np.linalg.norm(wrist - other_anchor)))
+
+    if len(distances) == 0:
+        return float(missing_pair_dist)
+
+    return float(np.min(np.asarray(distances, dtype=np.float32)))
+
+
+def _pairwise_body_anchor_distance_deltas(prev_persons, curr_persons, matches):
+    if len(matches) < 2:
+        return []
+
+    matched = []
+    for prev_idx, curr_idx, _quality in matches:
+        matched.append((
+            _person_body_anchor(prev_persons[prev_idx]),
+            _person_body_anchor(curr_persons[curr_idx]),
+        ))
+
+    deltas = []
+    for i in range(len(matched)):
+        prev_a, curr_a = matched[i]
+        for j in range(i + 1, len(matched)):
+            prev_b, curr_b = matched[j]
+            prev_dist = float(np.linalg.norm(prev_a - prev_b))
+            curr_dist = float(np.linalg.norm(curr_a - curr_b))
+            deltas.append(curr_dist - prev_dist)
+
+    return deltas
+
+
 def extended_limb_bbox_motion_features(prev_persons, curr_persons, curr_agg, **kwargs):
     """Extra robust features after the original 25 Erez motion dimensions."""
     close_dist_thresh = float(kwargs.get('close_pair_dist_thresh', DEFAULT_CLOSE_PAIR_DIST_THRESH))
@@ -589,13 +706,21 @@ def extended_limb_bbox_motion_features(prev_persons, curr_persons, curr_agg, **k
     elbow_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, ELBOW_KP)
     upper_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, UPPER_LIMB_KP)
     lower_motion = _relative_keypoint_motion(prev_persons, curr_persons, matches, LOWER_LIMB_KP)
+    body_pair_distance_deltas = _pairwise_body_anchor_distance_deltas(prev_persons, curr_persons, matches)
 
     upper_energy = _safe_mean(upper_motion)
     upper_visibility = _keypoint_visibility_ratio(curr_persons, UPPER_LIMB_KP)
     lower_visibility = _keypoint_visibility_ratio(curr_persons, LOWER_LIMB_KP)
+    prev_body_anchor_dist = _body_anchor_proximity_features(prev_persons, missing_pair_dist=missing_pair_dist)
+    curr_body_anchor_dist = _body_anchor_proximity_features(curr_persons, missing_pair_dist=missing_pair_dist)
+    curr_head_dist = _head_anchor_proximity_features(curr_persons, missing_pair_dist=missing_pair_dist)
     wrist_other_min_dist, wrist_near_other_ratio = _wrist_to_other_bbox_features(
         curr_persons,
         near_thresh=wrist_near_thresh,
+        missing_pair_dist=missing_pair_dist,
+    )
+    wrist_other_body_anchor_min = _wrist_to_other_body_anchor_min(
+        curr_persons,
         missing_pair_dist=missing_pair_dist,
     )
 
@@ -621,6 +746,12 @@ def extended_limb_bbox_motion_features(prev_persons, curr_persons, curr_agg, **k
         wrist_near_other_ratio,
         upper_energy * overlap_score,
         match_quality_mean,
+        curr_body_anchor_dist,
+        curr_body_anchor_dist - prev_body_anchor_dist,
+        curr_head_dist,
+        wrist_other_body_anchor_min,
+        _safe_mean(np.abs(np.asarray(body_pair_distance_deltas, dtype=np.float32))),
+        float(np.min(np.asarray(body_pair_distance_deltas, dtype=np.float32))) if body_pair_distance_deltas else 0.0,
     ], dtype=np.float32)
 
 
