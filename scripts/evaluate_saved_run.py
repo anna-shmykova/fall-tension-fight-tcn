@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -44,6 +45,7 @@ from src.utils.metrics import (
     compute_roc_points,
     confusion_stats_at_threshold,
     save_confusion_matrix_image,
+    save_event_probability_timeline_image,
     save_pr_curve_image,
     save_roc_curve_image,
     save_rows_csv,
@@ -157,6 +159,17 @@ def load_split(split_path: Path, data_root: Path) -> list[str]:
 def finite_or_none(value: Any) -> float | None:
     value_f = safe_float(value)
     return value_f if np.isfinite(value_f) else None
+
+
+def safe_slug(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value))
+    cleaned = cleaned.strip("._")
+    return cleaned or "item"
+
+
+def timeline_stem_for_path(json_path: str) -> str:
+    digest = hashlib.sha1(str(json_path).encode("utf-8")).hexdigest()[:8]
+    return f"{safe_slug(Path(json_path).stem)}_{digest}"
 
 
 def mean_or_none(values: list[float]) -> float | None:
@@ -744,11 +757,13 @@ def evaluate_event_methods_for_paths(
     merge_gap_sec: float,
     min_duration_sec: float,
     min_overlap_sec: float,
+    timeline_dir: Path | None = None,
 ) -> dict[str, Any]:
     per_file_rows: list[dict[str, Any]] = []
     match_rows: list[dict[str, Any]] = []
     fragment_rows: list[dict[str, Any]] = []
     interval_rows: list[dict[str, Any]] = []
+    timeline_rows: list[dict[str, Any]] = []
 
     for json_path in paths:
         records, gt_events, video_duration_sec, frame_dt_sec, frame_step = predict_event_records_for_path(
@@ -859,6 +874,30 @@ def evaluate_event_methods_for_paths(
                         **fragment,
                     }
                 )
+            if timeline_dir is not None and records:
+                timeline_path = timeline_dir / f"{timeline_stem_for_path(json_path)}__{method_name}.png"
+                save_event_probability_timeline_image(
+                    timeline_path,
+                    times_sec=np.asarray([float(record["time_sec"]) for record in records], dtype=np.float32),
+                    probs=np.asarray([float(record.get(prob_key, float("nan"))) for record in records], dtype=np.float32),
+                    threshold=threshold,
+                    gt_intervals=gt_events,
+                    pred_intervals=predicted_events,
+                    title=f"{Path(json_path).name} | {method_name} | thr={threshold:.2f}",
+                    video_duration_sec=video_duration_sec,
+                    prob_label=f"{method_name} probability",
+                )
+                timeline_rows.append(
+                    {
+                        "score_method": method_name,
+                        "json_path": json_path,
+                        "json_name": Path(json_path).name,
+                        "threshold": threshold,
+                        "timeline_png": str(timeline_path),
+                        "n_windows": int(len(records)),
+                        "video_duration_sec": float(video_duration_sec),
+                    }
+                )
 
     aggregate: dict[str, Any] = {}
     for method in methods:
@@ -876,6 +915,7 @@ def evaluate_event_methods_for_paths(
         "matches": match_rows,
         "fragments": fragment_rows,
         "intervals": interval_rows,
+        "timelines": timeline_rows,
         "aggregate": aggregate,
     }
 
@@ -1111,6 +1151,7 @@ def main() -> None:
         merge_gap_sec=float(args.event_merge_gap_sec),
         min_duration_sec=float(args.event_min_duration_sec),
         min_overlap_sec=float(args.event_min_overlap_sec),
+        timeline_dir=output_dir / "timelines",
     )
 
     selected_fpr = fpr_from_stats(selected_stats)
@@ -1125,6 +1166,7 @@ def main() -> None:
     save_rows_csv(output_dir / "event_matches.csv", event_eval["matches"])
     save_rows_csv(output_dir / "event_fragments.csv", event_eval["fragments"])
     save_rows_csv(output_dir / "event_intervals.csv", event_eval["intervals"])
+    save_rows_csv(output_dir / "timeline_images.csv", event_eval["timelines"])
     if roc_rows:
         save_rows_csv(output_dir / "roc.csv", roc_rows)
     if pr_rows:
@@ -1394,6 +1436,8 @@ def main() -> None:
             "event_matches_csv": str(output_dir / "event_matches.csv"),
             "event_fragments_csv": str(output_dir / "event_fragments.csv"),
             "event_intervals_csv": str(output_dir / "event_intervals.csv"),
+            "timeline_images_csv": str(output_dir / "timeline_images.csv"),
+            "timelines_dir": str(output_dir / "timelines"),
             "roc_csv": str(output_dir / "roc.csv"),
             "pr_csv": str(output_dir / "pr.csv"),
             "threshold_sweep_csv": str(output_dir / "threshold_sweep.csv"),

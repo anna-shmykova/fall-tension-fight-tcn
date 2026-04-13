@@ -1,5 +1,5 @@
 exp:
-  name: tcn_eventintraperson_graph_pool_motion_21_soft_4_loss_wind_8_step_1_dataset_v2_precise_streaming
+  name: tcn_event_intraperson_graph_pool_motion_21_overlap_frac_25_logmeanexp_wind_8_step_1_dataset_v2_precise_streaming
   seed: 42
 
 paths:
@@ -24,8 +24,8 @@ data:
     test_list: "fixed_splits/test_files_hospital.txt"
 
 window_labels:
-  rule: target #soft_last_k #target
-  positive_overlap: 0.30
+  rule: overlap_frac #soft_last_k #target
+  positive_overlap: 0.25
   soft_k: 4
 
 labels:
@@ -74,12 +74,12 @@ train:
   epochs: 15
   lr: 0.0005
   weight_decay: 0.0001
-  pos_weight: 1.0
+  pos_weight: 1.5
   grad_clip: 1.0
-  early_stop_patience: 3
+  early_stop_patience: 5
   num_workers: 0
   device: cuda
-  agg_mode: last
+  agg_mode: logmeanexp #last
   logsumexp_temperature: 1.0
   end_loss_alpha: 0.0
   end_loss_k: 1
@@ -90,3 +90,21 @@ eval:
     start: 0.01
     end: 0.99
     step: 0.01
+  event_validation:
+    enabled: true
+    # By default this uses data.split.val_list. Set list to a long-video-only
+    # validation file if you want window validation and event validation separate.
+    list: "fixed_splits/event_val_paths.txt"
+    every_n_epochs: 1
+    score_methods: ["raw", "temperature", "platt"]
+    threshold_start: 0.01
+    threshold_end: 0.99
+    threshold_step: 0.02
+    merge_gap_sec_values: [0.0, 0.5, 1.0, 2.0]
+    min_duration_sec_values: [0.0, 0.5, 1.0]
+    min_overlap_sec: 0.0
+    min_match_iou: 0.05
+    selection_score_method: platt
+    selection_metric: time_iou
+    max_false_alarms_per_min:
+    min_recall:  

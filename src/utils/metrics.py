@@ -652,3 +652,69 @@ def save_reliability_diagram_image(
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def save_event_probability_timeline_image(
+    out_path: Path,
+    *,
+    times_sec: np.ndarray,
+    probs: np.ndarray,
+    threshold: float,
+    gt_intervals: List[Dict[str, Any]] | None,
+    pred_intervals: List[Dict[str, Any]] | None,
+    title: str,
+    video_duration_sec: float | None = None,
+    prob_label: str = "Predicted probability",
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    times = np.asarray(times_sec, dtype=np.float64).reshape(-1)
+    values = np.asarray(probs, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(times) & np.isfinite(values)
+    times = times[mask]
+    values = np.clip(values[mask], 0.0, 1.0)
+    if times.size == 0:
+        return
+
+    duration = float(video_duration_sec) if video_duration_sec is not None and np.isfinite(video_duration_sec) else float(np.max(times))
+    duration = max(duration, float(np.max(times)))
+    duration = max(duration, 1e-6)
+
+    fig, ax = plt.subplots(figsize=(12.0, 4.6))
+
+    for idx, interval in enumerate(gt_intervals or []):
+        ax.axvspan(
+            float(interval["start_time_sec"]),
+            float(interval["end_time_sec"]),
+            ymin=0.02,
+            ymax=0.18,
+            color="tab:green",
+            alpha=0.22,
+            label="GT positive" if idx == 0 else None,
+        )
+
+    for idx, interval in enumerate(pred_intervals or []):
+        ax.axvspan(
+            float(interval["start_time_sec"]),
+            float(interval["end_time_sec"]),
+            ymin=0.82,
+            ymax=0.98,
+            color="tab:blue",
+            alpha=0.16,
+            label="Predicted positive" if idx == 0 else None,
+        )
+
+    ax.plot(times, values, color="black", linewidth=1.6, label=prob_label)
+    ax.axhline(float(threshold), color="tab:red", linestyle="--", linewidth=1.2, label=f"Threshold={float(threshold):.2f}")
+    ax.text(0.995, 0.90, "Pred spans", transform=ax.transAxes, ha="right", va="center", fontsize=9, color="tab:blue")
+    ax.text(0.995, 0.10, "GT spans", transform=ax.transAxes, ha="right", va="center", fontsize=9, color="tab:green")
+    ax.set_xlim(0.0, duration)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Time (sec)")
+    ax.set_ylabel("Probability")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
