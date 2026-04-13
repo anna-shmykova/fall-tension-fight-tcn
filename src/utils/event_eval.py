@@ -1010,22 +1010,33 @@ def save_rows_csv(out_path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def save_event_report(out_dir: Path, report: dict[str, Any], *, prefix: str) -> dict[str, str]:
+def save_event_report(
+    out_dir: Path,
+    report: dict[str, Any],
+    *,
+    prefix: str,
+    include_debug_tables: bool = False,
+) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     details = report.get("selected_details", {})
     artifact_paths = {
         "grid_csv": str(out_dir / f"{prefix}_event_grid.csv"),
         "per_file_csv": str(out_dir / f"{prefix}_event_per_file.csv"),
-        "matches_csv": str(out_dir / f"{prefix}_event_matches.csv"),
-        "fragments_csv": str(out_dir / f"{prefix}_event_fragments.csv"),
-        "intervals_csv": str(out_dir / f"{prefix}_event_intervals.csv"),
         "summary_json": str(out_dir / f"{prefix}_event_summary.json"),
     }
     save_rows_csv(Path(artifact_paths["grid_csv"]), report.get("grid", []))
     save_rows_csv(Path(artifact_paths["per_file_csv"]), details.get("per_file", []))
-    save_rows_csv(Path(artifact_paths["matches_csv"]), details.get("matches", []))
-    save_rows_csv(Path(artifact_paths["fragments_csv"]), details.get("fragments", []))
-    save_rows_csv(Path(artifact_paths["intervals_csv"]), details.get("intervals", []))
+    if include_debug_tables:
+        artifact_paths.update(
+            {
+                "matches_csv": str(out_dir / f"{prefix}_event_matches.csv"),
+                "fragments_csv": str(out_dir / f"{prefix}_event_fragments.csv"),
+                "intervals_csv": str(out_dir / f"{prefix}_event_intervals.csv"),
+            }
+        )
+        save_rows_csv(Path(artifact_paths["matches_csv"]), details.get("matches", []))
+        save_rows_csv(Path(artifact_paths["fragments_csv"]), details.get("fragments", []))
+        save_rows_csv(Path(artifact_paths["intervals_csv"]), details.get("intervals", []))
     payload = {
         "settings": report.get("settings", {}),
         "selected": report.get("selected", {}),

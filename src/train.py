@@ -32,8 +32,6 @@ from src.utils.metrics import (
     apply_temperature_scaling,
     compute_auroc,
     compute_auprc,
-    compute_pr_points,
-    compute_roc_points,
     fit_platt_scaling,
     fit_temperature_scaling,
     threshold_sweep_binary,
@@ -430,9 +428,11 @@ def save_probability_calibration_artifacts(
     y_prob: np.ndarray,
     title: str,
     n_bins: int = 10,
+    save_bins: bool = False,
 ) -> Dict[str, Any]:
     calibration = summarize_calibration(y_true, y_prob, n_bins=n_bins)
-    save_rows_csv(out_dir / f"{prefix}_calibration_bins.csv", calibration["bins"])
+    if save_bins:
+        save_rows_csv(out_dir / f"{prefix}_calibration_bins.csv", calibration["bins"])
     save_reliability_diagram_image(
         out_dir / f"{prefix}_reliability.png",
         y_true=y_true,
@@ -1530,9 +1530,6 @@ def main() -> None:
             selected_threshold = float(best_val_threshold if best_val_threshold is not None else test_out["best_f1"]["threshold"])
             selected_stats = confusion_stats_at_threshold(test_binary_targets, test_probs, threshold=selected_threshold)
             oracle_stats = test_out["best_threshold_stats"]
-            roc_rows = compute_roc_points(test_binary_targets, test_probs)
-            pr_rows = compute_pr_points(test_binary_targets, test_probs)
-
             event_val_final_report = None
             event_test_report = None
             event_val_final_artifacts = None
@@ -1682,11 +1679,6 @@ def main() -> None:
             save_threshold_sweep_csv(final_test_dir, test_out["sweep"])
             save_rows_csv(final_test_dir / "per_file.csv", per_file_rows)
             save_rows_csv(final_test_dir / "per_video.csv", per_video_rows)
-            if roc_rows:
-                save_rows_csv(final_test_dir / "roc.csv", roc_rows)
-            if pr_rows:
-                save_rows_csv(final_test_dir / "pr.csv", pr_rows)
-
             save_confusion_matrix_image(
                 final_test_dir / "cm_norm_thr_val_selected.png",
                 selected_stats,
@@ -1956,16 +1948,11 @@ def main() -> None:
                     "summary_csv": str(final_test_dir / "summary.csv"),
                     "per_file_csv": str(final_test_dir / "per_file.csv"),
                     "per_video_csv": str(final_test_dir / "per_video.csv"),
-                    "roc_csv": str(final_test_dir / "roc.csv"),
-                    "pr_csv": str(final_test_dir / "pr.csv"),
                     "threshold_sweep_csv": str(final_test_dir / "threshold_sweep.csv"),
                     "calibration_json": str(final_test_dir / "calibration.json"),
                     "window_test_raw_reliability": str(final_test_dir / "window_test_raw_reliability.png"),
-                    "window_test_raw_calibration_bins": str(final_test_dir / "window_test_raw_calibration_bins.csv"),
                     "window_test_temperature_reliability": str(final_test_dir / "window_test_temperature_reliability.png"),
-                    "window_test_temperature_calibration_bins": str(final_test_dir / "window_test_temperature_calibration_bins.csv"),
                     "window_test_platt_reliability": str(final_test_dir / "window_test_platt_reliability.png"),
-                    "window_test_platt_calibration_bins": str(final_test_dir / "window_test_platt_calibration_bins.csv"),
                 },
             }
             if event_val_final_report or event_test_report:
@@ -1974,17 +1961,21 @@ def main() -> None:
                     "validation": compact_event_report(event_val_final_report, event_val_final_artifacts),
                     "test": compact_event_report(event_test_report, event_test_artifacts),
                 }
-                final_test_payload["artifacts"].update(
-                    {
-                        "event_val_grid_csv": str(final_test_dir / "val_selected_event_grid.csv"),
-                        "event_val_summary_json": str(final_test_dir / "val_selected_event_summary.json"),
-                        "event_test_per_file_csv": str(final_test_dir / "test_selected_event_per_file.csv"),
-                        "event_test_matches_csv": str(final_test_dir / "test_selected_event_matches.csv"),
-                        "event_test_fragments_csv": str(final_test_dir / "test_selected_event_fragments.csv"),
-                        "event_test_intervals_csv": str(final_test_dir / "test_selected_event_intervals.csv"),
-                        "event_test_summary_json": str(final_test_dir / "test_selected_event_summary.json"),
-                    }
-                )
+                if event_val_final_artifacts:
+                    final_test_payload["artifacts"].update(
+                        {
+                            "event_val_grid_csv": str(final_test_dir / "val_selected_event_grid.csv"),
+                            "event_val_per_file_csv": str(final_test_dir / "val_selected_event_per_file.csv"),
+                            "event_val_summary_json": str(final_test_dir / "val_selected_event_summary.json"),
+                        }
+                    )
+                if event_test_artifacts:
+                    final_test_payload["artifacts"].update(
+                        {
+                            "event_test_per_file_csv": str(final_test_dir / "test_selected_event_per_file.csv"),
+                            "event_test_summary_json": str(final_test_dir / "test_selected_event_summary.json"),
+                        }
+                    )
             (final_test_dir / "metrics.json").write_text(
                 json.dumps(final_test_payload, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",

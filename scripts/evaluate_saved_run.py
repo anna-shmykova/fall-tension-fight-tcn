@@ -38,11 +38,10 @@ from src.train import (
     safe_float,
     summarize_video_scores,
 )
+from src.utils.event_eval import build_aggregate_event_stats, flatten_event_stats_for_csv
 from src.utils.metrics import (
     apply_platt_scaling,
     apply_temperature_scaling,
-    compute_pr_points,
-    compute_roc_points,
     confusion_stats_at_threshold,
     save_confusion_matrix_image,
     save_event_probability_timeline_image,
@@ -67,6 +66,18 @@ def resolve_cli_path(path_str: str | None) -> Path | None:
         return None
     path = Path(path_str).expanduser()
     return path.resolve()
+
+
+def parse_score_method_names(value: str, available: list[str]) -> set[str]:
+    requested = [item.strip() for item in str(value).split(",") if item.strip()]
+    if not requested:
+        return set()
+    if any(item.lower() == "all" for item in requested):
+        return set(available)
+    unknown = sorted(set(requested) - set(available))
+    if unknown:
+        raise ValueError(f"Unknown score methods: {', '.join(unknown)}. Available: {', '.join(available)}")
+    return set(requested)
 
 
 def resolve_device(requested: str | None, cfg_device: str | None) -> torch.device:
@@ -672,71 +683,6 @@ def attach_calibrated_event_probs(records: list[dict[str, Any]], methods: list[d
             record[str(method["prob_key"])] = float(prob)
 
 
-def flatten_event_stats_for_csv(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in stats.items()
-        if key not in {"matches", "unmatched_gt_indices", "unmatched_pred_indices", "gt_fragment_counts"}
-    }
-
-
-def build_aggregate_event_stats(rows: list[dict[str, Any]], matches: list[dict[str, Any]], fragments: list[dict[str, Any]]) -> dict[str, Any]:
-    tp = int(sum(int(row["tp"]) for row in rows))
-    fp = int(sum(int(row["fp"]) for row in rows))
-    fn = int(sum(int(row["fn"]) for row in rows))
-    n_pred = int(sum(int(row["n_predicted_events"]) for row in rows))
-    n_gt = int(sum(int(row["n_gt_events"]) for row in rows))
-    total_duration_sec = float(sum(safe_float(row["video_duration_sec"]) for row in rows))
-    total_gt_positive_sec = float(sum(safe_float(row["total_gt_positive_sec"]) for row in rows))
-    total_pred_positive_sec = float(sum(safe_float(row["total_pred_positive_sec"]) for row in rows))
-    total_overlap_sec = float(sum(safe_float(row["total_overlap_sec"]) for row in rows))
-    total_union_sec = max(total_gt_positive_sec + total_pred_positive_sec - total_overlap_sec, 0.0)
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) > 0.0 else 0.0
-    gt_hit_count = int(sum(1 for fragment in fragments if int(fragment["n_fragments"]) > 0))
-    fragment_counts = [float(fragment["n_fragments"]) for fragment in fragments]
-    method_matches = matches
-    ious = [float(match["iou"]) for match in method_matches]
-    gt_coverages = [float(match["gt_coverage"]) for match in method_matches]
-    onset_delays = [float(match["onset_delay_sec"]) for match in method_matches]
-    detection_delays = [float(match["detection_delay_sec"]) for match in method_matches]
-    offset_errors = [float(match["offset_error_sec"]) for match in method_matches]
-    return {
-        "n_files": int(len(rows)),
-        "n_predicted_events": n_pred,
-        "n_gt_events": n_gt,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "false_alarms_per_min": float(fp / (total_duration_sec / 60.0)) if total_duration_sec > 0.0 else None,
-        "gt_hit_count": gt_hit_count,
-        "gt_hit_recall": float(gt_hit_count / n_gt) if n_gt > 0 else 0.0,
-        "total_duration_sec": total_duration_sec,
-        "total_gt_positive_sec": total_gt_positive_sec,
-        "total_pred_positive_sec": total_pred_positive_sec,
-        "total_overlap_sec": total_overlap_sec,
-        "time_coverage": float(total_overlap_sec / total_gt_positive_sec) if total_gt_positive_sec > 0.0 else 0.0,
-        "time_iou": float(total_overlap_sec / total_union_sec) if total_union_sec > 0.0 else 0.0,
-        "mean_fragments_per_gt": mean_or_none(fragment_counts),
-        "median_fragments_per_gt": median_or_none(fragment_counts),
-        "max_fragments_per_gt": int(max(fragment_counts)) if fragment_counts else 0,
-        "mean_iou": mean_or_none(ious),
-        "median_iou": median_or_none(ious),
-        "mean_gt_coverage": mean_or_none(gt_coverages),
-        "median_gt_coverage": median_or_none(gt_coverages),
-        "mean_onset_delay_sec": mean_or_none(onset_delays),
-        "median_onset_delay_sec": median_or_none(onset_delays),
-        "mean_detection_delay_sec": mean_or_none(detection_delays),
-        "median_detection_delay_sec": median_or_none(detection_delays),
-        "mean_offset_error_sec": mean_or_none(offset_errors),
-        "median_offset_error_sec": median_or_none(offset_errors),
-    }
-
-
 def evaluate_event_methods_for_paths(
     model: torch.nn.Module,
     dataset_cls,
@@ -758,12 +704,11 @@ def evaluate_event_methods_for_paths(
     min_duration_sec: float,
     min_overlap_sec: float,
     timeline_dir: Path | None = None,
+    timeline_score_methods: set[str] | None = None,
 ) -> dict[str, Any]:
     per_file_rows: list[dict[str, Any]] = []
     match_rows: list[dict[str, Any]] = []
     fragment_rows: list[dict[str, Any]] = []
-    interval_rows: list[dict[str, Any]] = []
-    timeline_rows: list[dict[str, Any]] = []
 
     for json_path in paths:
         records, gt_events, video_duration_sec, frame_dt_sec, frame_step = predict_event_records_for_path(
@@ -785,23 +730,6 @@ def evaluate_event_methods_for_paths(
         attach_calibrated_event_probs(records, methods)
         pred_span_sec = positive_median_step([float(record["time_sec"]) for record in records], default=frame_dt_sec * max(window_step, 1))
         pred_span_frames = positive_median_int_step([int(record["frame"]) for record in records], default=frame_step * max(window_step, 1))
-
-        for gt_idx, event in enumerate(gt_events, start=1):
-            interval_rows.append(
-                {
-                    "score_method": "gt",
-                    "json_path": json_path,
-                    "json_name": Path(json_path).name,
-                    "event_index": int(gt_idx),
-                    "interval_kind": "gt",
-                    "threshold": "",
-                    "start_time_sec": float(event["start_time_sec"]),
-                    "end_time_sec": float(event["end_time_sec"]),
-                    "duration_sec": interval_duration_sec(event),
-                    "start_frame": int(event.get("start_frame", 0)),
-                    "end_frame": int(event.get("end_frame", 0)),
-                }
-            )
 
         for method in methods:
             method_name = str(method["score_method"])
@@ -838,22 +766,6 @@ def evaluate_event_methods_for_paths(
                     "unmatched_pred_indices": ",".join(str(idx) for idx in stats["unmatched_pred_indices"]),
                 }
             )
-            for pred_idx, event in enumerate(predicted_events, start=1):
-                interval_rows.append(
-                    {
-                        "score_method": method_name,
-                        "json_path": json_path,
-                        "json_name": Path(json_path).name,
-                        "event_index": int(pred_idx),
-                        "interval_kind": "predicted",
-                        "threshold": threshold,
-                        "start_time_sec": float(event["start_time_sec"]),
-                        "end_time_sec": float(event["end_time_sec"]),
-                        "duration_sec": interval_duration_sec(event),
-                        "start_frame": int(event.get("start_frame", 0)),
-                        "end_frame": int(event.get("end_frame", 0)),
-                    }
-                )
             for match in stats["matches"]:
                 match_rows.append(
                     {
@@ -874,7 +786,12 @@ def evaluate_event_methods_for_paths(
                         **fragment,
                     }
                 )
-            if timeline_dir is not None and records:
+            should_save_timeline = (
+                timeline_dir is not None
+                and records
+                and (timeline_score_methods is None or method_name in timeline_score_methods)
+            )
+            if should_save_timeline:
                 timeline_path = timeline_dir / f"{timeline_stem_for_path(json_path)}__{method_name}.png"
                 save_event_probability_timeline_image(
                     timeline_path,
@@ -886,17 +803,6 @@ def evaluate_event_methods_for_paths(
                     title=f"{Path(json_path).name} | {method_name} | thr={threshold:.2f}",
                     video_duration_sec=video_duration_sec,
                     prob_label=f"{method_name} probability",
-                )
-                timeline_rows.append(
-                    {
-                        "score_method": method_name,
-                        "json_path": json_path,
-                        "json_name": Path(json_path).name,
-                        "threshold": threshold,
-                        "timeline_png": str(timeline_path),
-                        "n_windows": int(len(records)),
-                        "video_duration_sec": float(video_duration_sec),
-                    }
                 )
 
     aggregate: dict[str, Any] = {}
@@ -912,10 +818,6 @@ def evaluate_event_methods_for_paths(
 
     return {
         "per_file": per_file_rows,
-        "matches": match_rows,
-        "fragments": fragment_rows,
-        "intervals": interval_rows,
-        "timelines": timeline_rows,
         "aggregate": aggregate,
     }
 
@@ -932,6 +834,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event_merge_gap_sec", type=float, default=0.0, help="Merge predicted/GT event intervals separated by at most this gap.")
     parser.add_argument("--event_min_duration_sec", type=float, default=0.0, help="Drop predicted event intervals shorter than this duration.")
     parser.add_argument("--event_min_overlap_sec", type=float, default=0.0, help="Minimum GT/predicted overlap required to count an event match.")
+    parser.add_argument(
+        "--timeline_score_methods",
+        default="raw",
+        help="Comma-separated score methods to render as timelines. Use 'all' to render every available method.",
+    )
     return parser.parse_args()
 
 
@@ -1071,8 +978,6 @@ def main() -> None:
     )
     selected_stats = confusion_stats_at_threshold(test_binary_targets, test_probs, threshold=selected_threshold)
     oracle_stats = test_out["best_threshold_stats"]
-    roc_rows = compute_roc_points(test_binary_targets, test_probs)
-    pr_rows = compute_pr_points(test_binary_targets, test_probs)
 
     print(f"[INFO] Evaluating {len(val_paths)} validation files for video-level threshold selection")
     val_path_rows = evaluate_paths_individually(
@@ -1131,6 +1036,10 @@ def main() -> None:
         threshold_max=float(test_video_max["selected_threshold"]),
     )
     event_methods = event_score_methods(calibration_report, raw_threshold=selected_threshold)
+    timeline_score_methods = parse_score_method_names(
+        args.timeline_score_methods,
+        [str(method["score_method"]) for method in event_methods],
+    )
     print(f"[INFO] Evaluating held-out test files for event-level report ({', '.join(method['score_method'] for method in event_methods)})")
     event_eval = evaluate_event_methods_for_paths(
         model,
@@ -1152,6 +1061,7 @@ def main() -> None:
         min_duration_sec=float(args.event_min_duration_sec),
         min_overlap_sec=float(args.event_min_overlap_sec),
         timeline_dir=output_dir / "timelines",
+        timeline_score_methods=timeline_score_methods,
     )
 
     selected_fpr = fpr_from_stats(selected_stats)
@@ -1163,14 +1073,6 @@ def main() -> None:
     save_rows_csv(output_dir / "per_file.csv", per_file_rows)
     save_rows_csv(output_dir / "per_video.csv", per_video_rows)
     save_rows_csv(output_dir / "event_per_file.csv", event_eval["per_file"])
-    save_rows_csv(output_dir / "event_matches.csv", event_eval["matches"])
-    save_rows_csv(output_dir / "event_fragments.csv", event_eval["fragments"])
-    save_rows_csv(output_dir / "event_intervals.csv", event_eval["intervals"])
-    save_rows_csv(output_dir / "timeline_images.csv", event_eval["timelines"])
-    if roc_rows:
-        save_rows_csv(output_dir / "roc.csv", roc_rows)
-    if pr_rows:
-        save_rows_csv(output_dir / "pr.csv", pr_rows)
 
     save_confusion_matrix_image(
         output_dir / "cm_norm_thr_val_selected.png",
@@ -1424,6 +1326,7 @@ def main() -> None:
                 "merge_gap_sec": float(args.event_merge_gap_sec),
                 "min_duration_sec": float(args.event_min_duration_sec),
                 "min_overlap_sec": float(args.event_min_overlap_sec),
+                "timeline_score_methods": sorted(timeline_score_methods),
             },
             "test": event_eval["aggregate"],
         },
@@ -1433,21 +1336,12 @@ def main() -> None:
             "per_file_csv": str(output_dir / "per_file.csv"),
             "per_video_csv": str(output_dir / "per_video.csv"),
             "event_per_file_csv": str(output_dir / "event_per_file.csv"),
-            "event_matches_csv": str(output_dir / "event_matches.csv"),
-            "event_fragments_csv": str(output_dir / "event_fragments.csv"),
-            "event_intervals_csv": str(output_dir / "event_intervals.csv"),
-            "timeline_images_csv": str(output_dir / "timeline_images.csv"),
             "timelines_dir": str(output_dir / "timelines"),
-            "roc_csv": str(output_dir / "roc.csv"),
-            "pr_csv": str(output_dir / "pr.csv"),
             "threshold_sweep_csv": str(output_dir / "threshold_sweep.csv"),
             "calibration_json": str(output_dir / "calibration.json"),
             "window_test_raw_reliability": str(output_dir / "window_test_raw_reliability.png"),
-            "window_test_raw_calibration_bins": str(output_dir / "window_test_raw_calibration_bins.csv"),
             "window_test_temperature_reliability": str(output_dir / "window_test_temperature_reliability.png"),
-            "window_test_temperature_calibration_bins": str(output_dir / "window_test_temperature_calibration_bins.csv"),
             "window_test_platt_reliability": str(output_dir / "window_test_platt_reliability.png"),
-            "window_test_platt_calibration_bins": str(output_dir / "window_test_platt_calibration_bins.csv"),
         },
     }
     (output_dir / "metrics.json").write_text(
