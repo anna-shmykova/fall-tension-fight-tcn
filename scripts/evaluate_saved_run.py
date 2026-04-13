@@ -134,6 +134,7 @@ def build_model(cfg: dict[str, Any], input_dim: int, state_dict: dict[str, Any] 
             kernel_size=int(model_cfg.get("kernel_size", 3)),
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),
+            dropout=float(model_cfg.get("dropout", 0.1)),
             input_proj_dim=int(model_cfg.get("input_proj_dim", 0)),
         )
 

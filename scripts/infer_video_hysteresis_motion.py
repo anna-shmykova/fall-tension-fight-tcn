@@ -136,6 +136,7 @@ def load_motion_model(ckpt_path: str, device: torch.device) -> MotionTCN:
         kernel_size=int(model_cfg.get("kernel_size", infer_kernel_size_from_state_dict(state_dict))),
         causal=bool(model_cfg.get("causal", True)),
         norm=str(model_cfg.get("norm", "group")),
+        dropout=float(model_cfg.get("dropout", 0.1)),
         input_proj_dim=input_proj_dim,
     )
     model.load_state_dict(state_dict, strict=True)

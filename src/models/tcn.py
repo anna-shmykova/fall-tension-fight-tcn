@@ -129,6 +129,51 @@ def resolve_dilations(num_layers=3, dilations=None):
         raise ValueError(f"num_layers={expected_layers} does not match len(dilations)={len(resolved)}")
     return resolved
 
+
+class ChannelLayerNorm1d(nn.Module):
+    """LayerNorm over channels for each time step independently."""
+
+    def __init__(self, num_channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(num_channels))
+
+    def forward(self, x):
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
+class ResidualChannelProject1d(nn.Module):
+    """Parameter-free channel projection for residual 1D blocks.
+
+    This keeps checkpoint compatibility with older TCN blocks that had no
+    learned skip projection.
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+
+    def forward(self, x):
+        if self.in_channels == self.out_channels:
+            return x
+        if self.in_channels < self.out_channels:
+            return F.pad(x, (0, 0, 0, self.out_channels - self.in_channels))
+        return x[:, : self.out_channels, :]
+
+
+def make_temporal_norm(norm, num_channels):
+    """Build a normalization layer for `[B, C, T]` temporal tensors."""
+    norm = str(norm).lower()
+    if norm == "batch":
+        return nn.BatchNorm1d(num_channels)
+    if norm == "layer":
+        return ChannelLayerNorm1d(num_channels)
+    if norm == "group":
+        return nn.GroupNorm(1, num_channels)
+    if norm == "none":
+        return nn.Identity()
+    raise ValueError(f"Unsupported norm: {norm}")
+
 class CausalConv1d(nn.Module):
     """Conv1d with left-only padding so output[t] depends only on input[:t]."""
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, bias=True):
@@ -152,9 +197,9 @@ class CausalConv1d(nn.Module):
 
 
 class TemporalConvBlock(nn.Module):
-    """One temporal conv block: conv -> norm -> ReLU."""
+    """Residual temporal conv block with normalization and dropout."""
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, causal=False, norm="group"):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, causal=False, norm="group", dropout=0.0):
         super().__init__()
         self.causal = bool(causal)
 
@@ -170,21 +215,19 @@ class TemporalConvBlock(nn.Module):
                 dilation=dilation,
             )
 
-        # NOTE: BatchNorm1d mixes statistics across time during training.
-        # For strict causality (no training-time leakage), prefer GroupNorm.
-        if norm == "batch":
-            self.norm = nn.BatchNorm1d(out_channels)
-        elif norm == "none":
-            self.norm = nn.Identity()
-        else:
-            self.norm = nn.GroupNorm(1, out_channels)
+        self.norm = make_temporal_norm(norm, out_channels)
+        self.dropout = nn.Dropout(float(dropout))
+        self.residual = ResidualChannelProject1d(in_channels, out_channels)
 
     def forward(self, x):
         """Apply one temporal block to `[B, C, T]` features."""
+        residual = self.residual(x)
         out = self.conv(x)
         out = self.norm(out)
         out = F.relu(out)
-        return out
+        out = self.dropout(out)
+        out = out + residual
+        return F.relu(out)
 
 
 class EventTCN(nn.Module):
@@ -316,6 +359,7 @@ class EventTCN(nn.Module):
                     dilation=dilation,
                     causal=causal,
                     norm=norm,
+                    dropout=dropout,
                 )
             )
             in_ch = hidden_dim
@@ -376,6 +420,7 @@ class MotionTCN(nn.Module):
                     kernel_size=3,
                     causal=True,
                     norm="group",
+                    dropout=0.1,
                     input_proj_dim=0,
     ):
         super().__init__()
@@ -399,6 +444,7 @@ class MotionTCN(nn.Module):
                     dilation=dilation,
                     causal=causal,
                     norm=norm,
+                    dropout=dropout,
                 )
             )
             in_ch = hidden_dim

@@ -1,5 +1,5 @@
 exp:
-  name: tcn_causal_intraperson_graph_pool_motion_42_wind_8_step_1_limb_bbox_dataset_v2
+  name: tcn_causal_interperson_intraperson_graph_pool_motion_21_wind_16_step_4_layer_norm_dataset_v2
   seed: 42
 
 paths:
@@ -9,8 +9,8 @@ paths:
 data:
   label_mode: "binary_tension"
   target_mode: last
-  window_size: 8
-  window_step: 1
+  window_size: 16
+  window_step: 4
   fps: 25
   sample_every_n_frames: 5
   max_persons: 25
@@ -57,10 +57,10 @@ features:
 model:
   type: "tcn"
   encoder_type: intraperson_graph
-  use_graph: false
+  use_graph: true
   use_attention_readout: false
   causal: true
-  norm: group
+  norm: layer
   hidden_dim: 64
   num_layers: 4
   dilations: [1, 2, 4, 8]
@@ -74,7 +74,7 @@ model:
 
 train:
   batch_size: 32
-  epochs: 15
+  epochs: 20
   lr: 0.0005
   weight_decay: 0.0001
   pos_weight: 2.0

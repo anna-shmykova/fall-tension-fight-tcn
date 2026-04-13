@@ -400,6 +400,7 @@ def load_model_from_payload(payload: dict, cfg: dict, args, device: torch.device
             kernel_size=int(model_cfg.get("kernel_size", infer_kernel_size_from_state_dict(state_dict))),
             causal=bool(model_cfg.get("causal", True)),
             norm=str(model_cfg.get("norm", "group")),
+            dropout=float(model_cfg.get("dropout", 0.1)),
             input_proj_dim=input_proj_dim,
         )
     else:

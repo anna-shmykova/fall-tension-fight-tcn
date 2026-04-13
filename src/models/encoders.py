@@ -226,31 +226,35 @@ class IntrapersonGraphLayer(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, h, xy, joint_mask, adjacency):
+    def forward(self, h, xy, joint_mask, edge_index):
         """Run one graph layer on flattened `[B*T*K, V, D]` joint tensors."""
-        target = h[:, :, None, :]
-        source = h[:, None, :, :]
+        if edge_index.numel() == 0:
+            return h * joint_mask.unsqueeze(-1).float()
+
+        dst_idx = edge_index[:, 0]
+        src_idx = edge_index[:, 1]
+
+        # Only gather real skeleton edges instead of materializing all VxV
+        # joint pairs and masking them afterwards.
+        target = h.index_select(1, dst_idx)
+        source = h.index_select(1, src_idx)
         # Relative geometry is part of the edge feature, so messages know
         # whether a neighbor is above/below/left/right of the current joint.
-        rel = xy[:, None, :, :] - xy[:, :, None, :]
+        rel = xy.index_select(1, src_idx) - xy.index_select(1, dst_idx)
 
-        edge_valid = adjacency[None, :, :] & joint_mask[:, :, None] & joint_mask[:, None, :]
-        msg_in = torch.cat(
-            [
-                target.expand(-1, -1, h.size(1), -1),
-                source.expand(-1, h.size(1), -1, -1),
-                rel,
-            ],
-            dim=-1,
-        )
+        edge_valid = joint_mask.index_select(1, dst_idx) & joint_mask.index_select(1, src_idx)
+        msg_in = torch.cat([target, source, rel], dim=-1)
         msg = self.edge_mlp(msg_in) * edge_valid.unsqueeze(-1).float()
 
         # Average only over valid skeleton neighbors.
-        denom = edge_valid.float().sum(dim=2, keepdim=True).clamp_min(1.0)
-        agg = msg.sum(dim=2) / denom
+        agg = torch.zeros_like(h)
+        agg.index_add_(1, dst_idx, msg)
+        denom = h.new_zeros(h.size(0), h.size(1), 1)
+        denom.index_add_(1, dst_idx, edge_valid.unsqueeze(-1).float())
+        agg = agg / denom.clamp_min(1.0)
 
         delta = self.node_mlp(torch.cat([h, agg], dim=-1))
-        has_neighbors = edge_valid.any(dim=2, keepdim=True)
+        has_neighbors = denom > 0
         out = self.norm(h + delta * has_neighbors.float())
         return out * joint_mask.unsqueeze(-1).float()
 
@@ -325,7 +329,8 @@ class IntrapersonGraphEncoder(nn.Module):
         for u, v in self.edges:
             adjacency[u, v] = True
             adjacency[v, u] = True
-        self.register_buffer("adjacency", adjacency, persistent=False)
+        edge_index = adjacency.nonzero(as_tuple=False)
+        self.register_buffer("edge_index", edge_index, persistent=False)
 
     def forward(self, pose_xyc, bbox_cxcywh=None):
         """Return one embedding per person plus the validity mask and bboxes."""
@@ -374,7 +379,7 @@ class IntrapersonGraphEncoder(nn.Module):
         both_hips_flat = both_hips.reshape(-1, 1).float()
 
         for layer in self.layers:
-            h = layer(h, xy_flat, joint_mask_flat, self.adjacency)
+            h = layer(h, xy_flat, joint_mask_flat, self.edge_index)
 
         # Read out one person embedding from the joint states using mean + max
         # pooling plus two small summary signals about skeleton quality.
